@@ -2,7 +2,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent } from 'react';
 import { trackConfigUsage } from '../../../shared/analytics/analytics';
-import { AppSwitch, ProgressBar, useToast } from '../../../shared/ui';
+import { AppDialog, AppSwitch, ProgressBar, useToast } from '../../../shared/ui';
 import type { BackgroundTaskState, OutlineSelectionItem, SaveOutlineRequest, SaveOutlineSelectionRequest, TechnicalPlanWorkflowKind } from '../types';
 import type { KnowledgeBaseIndex, KnowledgeDocument } from '../../knowledge-base/types';
 import { OUTLINE_CONTENT_MODE_LABELS } from '../../../shared/types';
@@ -15,6 +15,8 @@ import OutlineSelectionDialog from '../components/OutlineSelectionDialog';
 interface OutlineEditPageProps {
   workflowKind: TechnicalPlanWorkflowKind;
   projectOverview: string;
+  bidAnalysisReady: boolean;
+  technicalScoreMissing: boolean;
   outlineMode: OutlineMode;
   outlineExpansionMode: OutlineExpansionMode;
   outlineWordControlOptions: OutlineWordControlOptions;
@@ -336,6 +338,8 @@ function includesKeyword(value: string, keyword: string) {
 function OutlineEditPage({
   workflowKind,
   projectOverview,
+  bidAnalysisReady,
+  technicalScoreMissing,
   outlineMode,
   outlineExpansionMode,
   outlineWordControlOptions,
@@ -362,6 +366,7 @@ function OutlineEditPage({
   const [startingOutline, setStartingOutline] = useState(false);
   const [progressCollapsed, setProgressCollapsed] = useState(false);
   const [generationDialogOpen, setGenerationDialogOpen] = useState(false);
+  const [noScoreConfirmationOpen, setNoScoreConfirmationOpen] = useState(false);
   const [draftOutlineMode, setDraftOutlineMode] = useState<OutlineMode>(outlineMode === 'standalone-technical' ? 'standalone-technical' : 'response-file');
   const [draftOutlineExpansionMode, setDraftOutlineExpansionMode] = useState<OutlineExpansionMode>(outlineExpansionMode);
   const [draftKnowledgeDocumentIds, setDraftKnowledgeDocumentIds] = useState<string[]>(referenceKnowledgeDocumentIds);
@@ -554,6 +559,10 @@ function OutlineEditPage({
       showToast('请先完成招标文件解析', 'info');
       return;
     }
+    if (!bidAnalysisReady) {
+      showToast('请先完成必填招标文件解析项', 'info');
+      return;
+    }
 
     setDraftOutlineMode(outlineMode === 'standalone-technical' ? 'standalone-technical' : 'response-file');
     setDraftOutlineExpansionMode(isExpansionWorkflow ? outlineExpansionMode : 'ai-complement');
@@ -601,13 +610,22 @@ function OutlineEditPage({
     }
   };
 
-  const generateOutline = async () => {
+  const generateOutline = async (noTechnicalScoreMode = false) => {
     const lockMessage = getMutationLockMessage();
     if (lockMessage) {
       throw new Error(lockMessage);
     }
     if (!projectOverview) {
       showToast('请先完成招标文件解析', 'info');
+      return;
+    }
+    if (!bidAnalysisReady) {
+      showToast('请先完成必填招标文件解析项', 'info');
+      return;
+    }
+    if (technicalScoreMissing && !noTechnicalScoreMode) {
+      setGenerationDialogOpen(false);
+      setNoScoreConfirmationOpen(true);
       return;
     }
 
@@ -631,6 +649,7 @@ function OutlineEditPage({
         outline_mode: nextOutlineMode,
         outline_expansion_mode: nextOutlineExpansionMode,
         word_control_options: wordControlOptions,
+        no_technical_score_mode: noTechnicalScoreMode,
       });
       trackConfigUsage({
         outline_mode: isExpansionWorkflow ? nextOutlineExpansionMode : nextOutlineMode,
@@ -1263,7 +1282,7 @@ function OutlineEditPage({
             type="button"
             className="outline-config-action"
             onClick={openGenerationDialog}
-            disabled={generating || sorting || contentMutationLocked || !projectOverview}
+            disabled={generating || sorting || contentMutationLocked || !projectOverview || !bidAnalysisReady}
             aria-label="打开目录生成配置"
             title="目录生成配置"
           >
@@ -1272,7 +1291,7 @@ function OutlineEditPage({
               <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.05.05a2 2 0 0 1-2.83 2.83l-.05-.05a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 0 1-4 0v-.08a1.7 1.7 0 0 0-1.04-1.56 1.7 1.7 0 0 0-1.87.34l-.05.05a2 2 0 0 1-2.83-2.83l.05-.05A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 0 1 0-4h.08A1.7 1.7 0 0 0 4.6 8.93a1.7 1.7 0 0 0-.34-1.87l-.05-.05a2 2 0 0 1 2.83-2.83l.05.05a1.7 1.7 0 0 0 1.87.34A1.7 1.7 0 0 0 10 3.01V3a2 2 0 0 1 4 0v.08a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.05-.05a2 2 0 0 1 2.83 2.83l-.05.05a1.7 1.7 0 0 0-.34 1.87 1.7 1.7 0 0 0 1.56 1.04H21a2 2 0 0 1 0 4h-.08A1.7 1.7 0 0 0 19.4 15Z" />
             </svg>
           </button>
-          <button type="button" className="primary-action" onClick={openGenerationDialog} disabled={generating || sorting || contentMutationLocked || !projectOverview}>
+          <button type="button" className="primary-action" onClick={openGenerationDialog} disabled={generating || sorting || contentMutationLocked || !projectOverview || !bidAnalysisReady}>
             {generating ? 'AI 正在生成目录' : outlineData ? '重新生成目录' : '生成目录'}
           </button>
         </div>
@@ -1535,13 +1554,36 @@ function OutlineEditPage({
               <button type="button" className="secondary-action" onClick={() => { void saveOutlineConfig(); }} disabled={generating || contentMutationLocked || savingOutlineConfig}>
                 {savingOutlineConfig ? '正在保存...' : '保存配置'}
               </button>
-              <button type="button" className="primary-action" onClick={generateOutline} disabled={generating || contentMutationLocked || savingOutlineConfig || !projectOverview}>
+              <button type="button" className="primary-action" onClick={() => { void generateOutline(); }} disabled={generating || contentMutationLocked || savingOutlineConfig || !projectOverview || !bidAnalysisReady}>
                 {outlineData ? '重新生成目录' : '开始生成'}
               </button>
             </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      <AppDialog
+        open={noScoreConfirmationOpen}
+        onOpenChange={(open) => {
+          setNoScoreConfirmationOpen(open);
+          if (!open) setGenerationDialogOpen(true);
+        }}
+        kicker="生成目录"
+        title="确认无技术评分项模式"
+        description="未解析到技术评分项，请您确认是否以无技术评分项模式开始编写投标文件？"
+        actions={(
+          <>
+            <button type="button" className="secondary-action" onClick={() => {
+              setNoScoreConfirmationOpen(false);
+              setGenerationDialogOpen(true);
+            }}>取消</button>
+            <button type="button" className="primary-action" onClick={() => {
+              setNoScoreConfirmationOpen(false);
+              void generateOutline(true);
+            }}>确认</button>
+          </>
+        )}
+      />
     </div>
   );
 }

@@ -7,7 +7,7 @@ import GlobalFactsPage from './GlobalFactsPage';
 import ContentEditPage from './ContentEditPage';
 import { TemplatePreview } from '../../export-format/pages/ExportFormatPage';
 import { useTechnicalPlanWorkflow } from '../hooks/useTechnicalPlanWorkflow';
-import { bidAnalysisTasks, getBidAnalysisTasks, isMissingBidAnalysisResult } from '../services/bidAnalysisWorkflow';
+import { bidAnalysisTasks, getBidAnalysisTasks, isMissingBidAnalysisResult, isMissingTechnicalScoreItems } from '../services/bidAnalysisWorkflow';
 import { trackPageView } from '../../../shared/analytics/analytics';
 import { AppDialog, FloatingToolbar, ProgressBar, ToolbarArrowLeftIcon, ToolbarArrowRightIcon, ToolbarDocumentIcon, ToolbarSparkleIcon, useToast } from '../../../shared/ui';
 import type { BackgroundTaskState, BidAnalysisTasks, ContentGenerationOptions, GlobalFactGroupState, GlobalFactsMode, SaveOutlineRequest, SaveOutlineSelectionRequest, TechnicalPlanState, TechnicalPlanStep, TechnicalPlanWorkflowKind } from '../types';
@@ -361,8 +361,11 @@ function TechnicalPlanHome({ workflowKind, registerLeaveGuard, onSectionChange }
   const bidSectionReady = state.bidSectionMode !== 'multiple'
     || (state.bidSectionExtractionStatus === 'success' && !isBidSectionExtractionRunning && selectedBidSectionValid);
   const bidAnalysisReady = requiredBidAnalysisReady && !isBidAnalysisTaskRunning && bidSectionReady;
+  const technicalScoreMissing = state.bidAnalysisTasks.techRequirements?.status === 'success'
+    && isMissingTechnicalScoreItems(state.bidAnalysisTasks.techRequirements.content);
   const firstMissingBidAnalysisTask = bidAnalysisTasks.find((task) => (
-    state.bidAnalysisSelectedTaskIds.includes(task.id)
+    task.id !== 'techRequirements'
+    && state.bidAnalysisSelectedTaskIds.includes(task.id)
     && isMissingBidAnalysisResult(task, state.bidAnalysisTasks[task.id]?.content)
   ));
   const globalFactsReady = state.globalFacts.length > 0 && state.globalFactsTask?.status === 'success';
@@ -1363,6 +1366,8 @@ function TechnicalPlanHome({ workflowKind, registerLeaveGuard, onSectionChange }
           <OutlineEditPage
             workflowKind={workflowKind}
             projectOverview={state.projectOverview}
+            bidAnalysisReady={bidAnalysisReady && !firstMissingBidAnalysisTask}
+            technicalScoreMissing={technicalScoreMissing}
             outlineMode={state.outlineMode}
             outlineExpansionMode={state.outlineExpansionMode || 'ai-complement'}
           outlineWordControlOptions={state.outlineWordControlOptions}
