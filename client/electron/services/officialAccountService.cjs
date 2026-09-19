@@ -33,6 +33,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   let clientId = '';
   let loading = true;
   let sessionError = '';
+  let apiKeyError = '';
   let closed = false;
   let startPromise = null;
   let tail = Promise.resolve();
@@ -45,6 +46,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   let balanceRetryAt = 0;
   let orderRetryAt = 0;
   let creatingOrder = null;
+  let refreshingBalance = null;
   let qrCodes = [];
   let qrCleanupTimer = null;
 
@@ -55,7 +57,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       status: loading ? 'loading' : account ? 'signed-in' : 'signed-out',
       clientId,
       identityType: account ? session.kind : null,
-      error: sessionError,
+      error: apiKeyError || sessionError,
       email: account?.email || null,
       accountId: account?.accountId || null,
       availablePoint: account?.availablePoint ?? null,
@@ -167,6 +169,26 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     return result.data;
   }
 
+  // 列表按创建时间倒序返回；复用最新有效同名 Key，没有则创建并立即保存。
+  async function syncApiKey() {
+    try {
+      const keys = await request('/api-keys', { method: 'GET', authenticated: true });
+      if (!Array.isArray(keys)) throw new Error('API Key 列表格式不正确');
+      const key = keys.find((item) => item.name === '易标开源版' && item.status === 'ACTIVE'
+        && (!item.expireTime || Date.parse(item.expireTime) > Date.now()))
+        || await request('/api-keys', { body: { name: '易标开源版' }, authenticated: true });
+      if (typeof key?.apiKey !== 'string' || !key.apiKey.trim()) throw new Error('接口未返回完整 API Key');
+      configStore.save({ text_model_profiles: { official: { api_key: key.apiKey } } });
+      apiKeyError = '';
+    } catch (error) {
+      apiKeyError = '获取官方 API Key 失败，请重启软件或重新登录';
+      throw new Error(apiKeyError, { cause: error });
+    } finally {
+      loading = false;
+      publish();
+    }
+  }
+
   // 安排唯一的刷新任务，网络重试也使用同一个计时器。
   function scheduleRefresh(delay) {
     clearTimeout(refreshTimer);
@@ -241,6 +263,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       else acceptAnonymousToken(await request('/tokens/refresh', { authenticated: true }));
       acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
       if (!orderTrackingStarted) beginOrderTracking();
+      return true;
     } catch (error) {
       handleAutomaticFailure(error);
     }
@@ -276,7 +299,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
         publish();
         if (fs.existsSync(sessionFile)) session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
         if (session?.kind === 'email') {
-          await refreshSession();
+          if (await refreshSession()) await syncApiKey();
           return;
         }
         session = null;
@@ -284,6 +307,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
         acceptAnonymousToken(await request('/clients/register', { body: { clientId } }));
         acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
         beginOrderTracking();
+        await syncApiKey();
       } catch (error) {
         handleAutomaticFailure(error);
       }
@@ -301,9 +325,8 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     return enqueue(async () => {
       const result = await request('/email/login', { body: { email, code } });
       acceptEmailLogin(result.login, result.account);
-      loading = false;
-      publish();
       beginOrderTracking();
+      await syncApiKey();
       return getState();
     });
   }
@@ -313,11 +336,20 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     return enqueue(async () => {
       const result = await request('/email/bind', { body: { email, code }, authenticated: true });
       acceptEmailLogin(result.login, result.account);
-      loading = false;
-      publish();
       beginOrderTracking();
+      await syncApiKey();
       return getState();
     });
+  }
+
+  // 页面和手动刷新共用同一请求，沿用当前会话查询并广播最新余额。
+  function refreshBalance() {
+    if (refreshingBalance) return refreshingBalance;
+    refreshingBalance = enqueue(async () => {
+      acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
+      return getState();
+    }).finally(() => { refreshingBalance = null; });
+    return refreshingBalance;
   }
 
   // 兑换成功后查询当前余额；幂等响应中的余额是首次入账快照。
@@ -473,6 +505,23 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     });
   }
 
+  // 两种登录身份共用消费接口，凭据及查询范围由现有账户鉴权处理。
+  function getTransactions(page) {
+    return enqueue(async () => {
+      const data = await request(`/account/consume-records?current=${page}&size=5`, {
+        method: 'GET', authenticated: true,
+      });
+      const current = Number(data?.current);
+      const size = Number(data?.size);
+      const total = Number(data?.total);
+      if (!Array.isArray(data?.records) || !Number.isSafeInteger(current) || current < 1
+        || !Number.isSafeInteger(size) || size < 1 || !Number.isSafeInteger(total) || total < 0) {
+        throw new Error('官方流水接口返回的分页数据不完整，请重试');
+      }
+      return { records: data.records, current, size, total };
+    });
+  }
+
   // 先查询服务端状态，仅为仍待支付的订单附上当前账户的有效本地缓存。
   function getRechargeOrder(id) {
     return enqueue(async () => {
@@ -528,8 +577,8 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     return tail;
   }
 
-  return { start, getState, onChanged, sendEmailCode, loginWithEmail, bindEmail, getRechargeOptions,
-    redeemCode, createInvoiceApplication, createRechargeOrder, getRechargeOrders, getRechargeOrder, closeRechargeOrder, onRechargeOrderChanged, close };
+  return { start, getState, onChanged, sendEmailCode, loginWithEmail, bindEmail, refreshBalance, getRechargeOptions,
+    redeemCode, createInvoiceApplication, createRechargeOrder, getRechargeOrders, getTransactions, getRechargeOrder, closeRechargeOrder, onRechargeOrderChanged, close };
 }
 
 module.exports = { createOfficialAccountService };
