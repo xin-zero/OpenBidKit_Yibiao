@@ -57,8 +57,8 @@ static class RestrictedHtmlDocumentRenderer
     static string _parsedHtmlSource = "";
     static IDocument? _parsedHtml;
 
-    /// <summary>一次样张渲染的产物：块数，以及按文档顺序排列的段落角色。</summary>
-    public readonly record struct RenderResult(int BlockCount, IReadOnlyList<string> ParagraphRoles);
+    /// <summary>一次样张渲染的产物：块数、按文档顺序排列的段落角色，以及改为文字提示的配图。</summary>
+    public readonly record struct RenderResult(int BlockCount, IReadOnlyList<string> ParagraphRoles, IReadOnlyList<ImageWarning> ImageWarnings);
 
     /// <summary>新建骨架、直接写入 HTML 正文，再统一应用模板格式。</summary>
     public static RenderResult Render(
@@ -67,10 +67,12 @@ static class RestrictedHtmlDocumentRenderer
         string html,
         JsonElement exportFormat,
         ChromeAssets? chrome = null,
-        bool wholeDocument = false)
+        bool wholeDocument = false,
+        IReadOnlyDictionary<string, string>? assetTypes = null)
     {
         chrome ??= ChromeAssets.Empty;
-        if (wholeDocument) return RenderWholeDocument(assetRoot, outputPath, html, exportFormat, chrome);
+        var assets = new FigureAssets(assetTypes);
+        if (wholeDocument) return RenderWholeDocument(assetRoot, outputPath, html, exportFormat, chrome, assets);
         var format = new FormatReader(exportFormat);
         var prepared = PrepareHtml(html, format);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
@@ -86,13 +88,14 @@ static class RestrictedHtmlDocumentRenderer
             mainPart.Document.Body!,
             format.Number(format.Section("image"), "max_width_percent", 90),
             prepared.Document,
+            assets,
             cacheAssets: true);
         ApplyFormatting(document, format, prepared.Tables);
-        return new RenderResult(blockCount, CollectParagraphRoles(document));
+        return new RenderResult(blockCount, CollectParagraphRoles(document), assets.Warnings);
     }
 
     /// <summary>在同一 Word 包内转换各样式范围，共享图片关系；仅在页面范围切换时分节。</summary>
-    static RenderResult RenderWholeDocument(string assetRoot, string outputPath, string html, JsonElement exportFormat, ChromeAssets chrome)
+    static RenderResult RenderWholeDocument(string assetRoot, string outputPath, string html, JsonElement exportFormat, ChromeAssets chrome, FigureAssets assets)
     {
         var format = new FormatReader(exportFormat);
         var basicPage = new Dictionary<string, JsonElement>();
@@ -130,7 +133,7 @@ static class RestrictedHtmlDocumentRenderer
                 body.AppendChild(section.CloneNode(true));
                 var prepared = PrepareHtml(range.InnerHtml, rangeFormat, outlineOnly: true);
                 blockCount += RestrictedHtmlWordInserter.InsertIntoContent(assetRoot, mainPart, body,
-                    rangeFormat.Number(rangeFormat.Section("image"), "max_width_percent", 90), prepared.Document, cacheAssets: true);
+                    rangeFormat.Number(rangeFormat.Section("image"), "max_width_percent", 90), prepared.Document, assets, cacheAssets: true);
                 ApplyLayoutBookmarks(body, result.Concat(pageElements).SelectMany(item => item.Descendants<Wp.BookmarkStart>()).Count());
                 ApplyFormatting(document, rangeFormat, prepared.Tables, rangeOnly: true);
                 foreach (var element in body.ChildElements.Where(item => item is not Wp.SectionProperties).ToList())
@@ -172,7 +175,7 @@ static class RestrictedHtmlDocumentRenderer
         mainPart.Document.Save();
         foreach (var part in mainPart.HeaderParts) part.Header.Save();
         foreach (var part in mainPart.FooterParts) part.Footer.Save();
-        return new RenderResult(blockCount, CollectParagraphRoles(document));
+        return new RenderResult(blockCount, CollectParagraphRoles(document), assets.Warnings);
     }
 
     /// <summary>自检副本的定位段落转为零宽书签，不进入可见正文或改变分页。</summary>
@@ -411,11 +414,23 @@ static class RestrictedHtmlDocumentRenderer
         stylesPart.Styles.Save();
     }
 
-    /// <summary>要求 Word 或编辑器打开文档时刷新页码域。</summary>
+    /// <summary>
+    /// 要求 Word 或编辑器打开文档时刷新页码域，并声明 Word 2013 及以上的兼容模式 15。
+    /// 不写兼容模式时 Word 按 2007 规则排版：百分比宽度的表格会把单元格左右边距加在栏宽之外，
+    /// 满宽表格和章节页框只能写死绝对宽度，用户在 Word 里改页边距后就与标题段落边框错开。
+    /// 子元素顺序按 OOXML schema：updateFields 在 compat 之前。
+    /// </summary>
     static void AddDocumentSettings(MainDocumentPart mainPart)
     {
         var settingsPart = mainPart.AddNewPart<DocumentSettingsPart>();
-        settingsPart.Settings = new Wp.Settings(new Wp.UpdateFieldsOnOpen { Val = true });
+        settingsPart.Settings = new Wp.Settings(
+            new Wp.UpdateFieldsOnOpen { Val = true },
+            new Wp.Compatibility(new Wp.CompatibilitySetting
+            {
+                Name = Wp.CompatSettingNameValues.CompatibilityMode,
+                Uri = "http://schemas.microsoft.com/office/word",
+                Val = "15",
+            }));
         settingsPart.Settings.Save();
     }
 
@@ -1110,21 +1125,13 @@ static class RestrictedHtmlDocumentRenderer
         var properties = table.GetFirstChild<Wp.TableProperties>() ?? table.PrependChild(new Wp.TableProperties());
         properties.RemoveAllChildren();
         var fullWidth = format.Bool(style, "full_width", true);
-        // 满宽表格的宽度用 dxa 写死成正文栏宽。tblW 用百分比时 Word 会把单元格左右边距
-        // 加在百分比宽度之外，表格比正文栏宽出两个边距（默认配比 0.4cm），右边顶出页边距。
-        // 嵌套表格的百分比是相对父单元格算的，换成绝对宽度会撑破单元格，只处理顶层表格。
-        var pinnedWidth = fullWidth && table.Parent is Wp.Body;
-        properties.AppendChild(pinnedWidth
-            ? new Wp.TableWidth
-            {
-                Type = Wp.TableWidthUnitValues.Dxa,
-                Width = ContentWidthTwips(format).ToString(CultureInfo.InvariantCulture),
-            }
-            : new Wp.TableWidth
-            {
-                Type = fullWidth ? Wp.TableWidthUnitValues.Pct : Wp.TableWidthUnitValues.Auto,
-                Width = fullWidth ? "5000" : "0",
-            });
+        // 满宽表格按栏宽 100%，用户在 Word 里改页边距或分栏后随之调整；嵌套表格相对父单元格。
+        // 依赖 AddDocumentSettings 的兼容模式 15：外沿正好落在页边距上，不再外扩单元格边距。
+        properties.AppendChild(new Wp.TableWidth
+        {
+            Type = fullWidth ? Wp.TableWidthUnitValues.Pct : Wp.TableWidthUnitValues.Auto,
+            Width = fullWidth ? "5000" : "0",
+        });
 
         var borderColor = Color(format.Text(style, "border_color", "#dcdff6"), "DCDFF6");
         var borderSize = (uint)Math.Clamp((int)Math.Round(format.Number(style, "border_width", 1) * 8), 0, 96);
@@ -1583,7 +1590,11 @@ static class RestrictedHtmlDocumentRenderer
         FlushContent();
     }
 
-    /// <summary>按业务表列边界的并集建网格，正文每段一通栏行，业务表直接展开为同级行。</summary>
+    /// <summary>
+    /// 按业务表列边界的并集建网格，正文每段一通栏行，业务表直接展开为同级行。
+    /// 表宽取栏宽 100%，Word 里改页边距后与标题段落边框一起移动；网格仍按导出时的栏宽计算，
+    /// 只作为各列比例，Word 按新栏宽等比缩放。
+    /// </summary>
     static Wp.Table CreateChapterBodyTable(IReadOnlyList<OpenXmlElement> content, FormatReader format, string color, HashSet<Wp.Paragraph> captions)
     {
         var width = ContentWidthTwips(format);
@@ -1604,7 +1615,7 @@ static class RestrictedHtmlDocumentRenderer
 
         var grid = boundaries.ToArray();
         var result = new Wp.Table(new Wp.TableProperties(
-            new Wp.TableWidth { Type = Wp.TableWidthUnitValues.Dxa, Width = width.ToString(CultureInfo.InvariantCulture) },
+            new Wp.TableWidth { Type = Wp.TableWidthUnitValues.Pct, Width = "5000" },
             new Wp.TableJustification { Val = Wp.TableRowAlignmentValues.Center },
             new Wp.TableBorders(
                 CreateTableBorder<Wp.TopBorder>(color, 6), CreateTableBorder<Wp.LeftBorder>(color, 6),

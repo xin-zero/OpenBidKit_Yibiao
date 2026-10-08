@@ -1,3 +1,4 @@
+const Ajv = require('ajv');
 const { buildBidSectionContextHint } = require('../utils/bidSectionContext.cjs');
 const { GLOBAL_FACTS_AGENT_TASK_KEY } = require('./globalFactsAgentV2Config.cjs');
 const {
@@ -39,12 +40,33 @@ function formatProgressTitle(value) {
   return Array.from(title).slice(0, 20).join('');
 }
 
-function readJson(content, label) {
+const factsAjv = new Ajv({ allErrors: true, strict: true });
+const validateFactsSchema = factsAjv.compile(GLOBAL_FACTS_JSON_SCHEMA);
+
+// 生成与 AI 调整共用提交报告；明确的产物问题阻止提交，未知执行错误继续抛出。
+function validateGlobalFactsOutput(content) {
+  let generated;
   try {
-    return JSON.parse(String(content || '').trim());
+    generated = JSON.parse(String(content || '').trim());
   } catch (error) {
-    throw new Error(`${label}不是合法 JSON：${error?.message || String(error)}`);
+    if (!(error instanceof SyntaxError)) throw error;
+    return { value: null, issues: [{ severity: 'blocking', file: GLOBAL_FACTS_OUTPUT_FILE,
+      message: `${GLOBAL_FACTS_OUTPUT_FILE}不是合法 JSON：${error.message}` }] };
   }
+  if (!validateFactsSchema(generated)) {
+    return { value: generated, issues: validateFactsSchema.errors.map(item => ({
+      severity: 'blocking', file: GLOBAL_FACTS_OUTPUT_FILE, path: item.instancePath || '/',
+      message: `${GLOBAL_FACTS_OUTPUT_FILE} 格式错误：${item.instancePath || '/'} ${item.message}`,
+    })) };
+  }
+  const normalized = normalizeGlobalFactsResponse(generated);
+  try {
+    validateGlobalFactsResponse(normalized);
+  } catch (error) {
+    if (error?.code || error?.constructor !== Error) throw error;
+    return { value: normalized, issues: [{ severity: 'blocking', file: GLOBAL_FACTS_OUTPUT_FILE, message: error.message }] };
+  }
+  return { value: normalized, issues: [] };
 }
 
 function sanitizeFileName(value, fallback = '招标文件') {
@@ -195,7 +217,7 @@ function buildWorkPrinciples({ hasKnowledge, hasOriginalPlan }) {
   next += 1;
   principles.push(`${next}. 必须包含工期、运维期或交货时间中的至少一个相关变量；缺具体值时按本任务给定的写法填写，不要省略该项。`);
   next += 1;
-  principles.push(`${next}. 材料较长时用检索定位，不要因为一次读不完就漏项。`);
+  principles.push(`${next}. 材料较长时，先结合章节结构分段检查，再用 grep 定位具体事实和关联条款。多份招标材料分别跟踪已处理范围，逐步整理事实大项；补充具体值时按主题读取相关材料。可用 node、jq 辅助合并条目和定位重复项，事实含义及冲突由你判断。`);
   if (hasKnowledge) {
     next += 1;
     principles.push(`${next}. 用参考知识库补充已有大项的具体内容，不要仅因知识库出现新话题就新增大项。`);
@@ -224,9 +246,9 @@ ${buildWorkPrinciples({ hasKnowledge, hasOriginalPlan })}
 ${buildMissingValueRule(globalFactsMode)}
 
 输出：
-1. 只写入 ${GLOBAL_FACTS_OUTPUT_FILE}，必须是纯 JSON，不要 Markdown 代码块。
+1. 最终结果写入 ${GLOBAL_FACTS_OUTPUT_FILE}，必须是纯 JSON，不要 Markdown 代码块。
 2. 根对象只有 groups；每项包含 id、title、content。
-3. 程序已为该文件开启写入时自动 Schema 校验。使用 write 或 edit 后根据工具返回结果处理：失败时继续修复；通过且确认全部工作完成时，在最后一次 write 或 edit 中传 task_complete=true。已通过自动校验后不要重复调用 json-validation。
+3. 程序已为该文件预置 Schema，可用 json-validation 自查，只传 file_path。确认全部工作完成时，在最后一次成功的写入或修改中传 task_complete=true；结束后程序统一校验，不通过会退回问题清单继续修复。
 
 格式示意：
 ${buildJsonExample(globalFactsMode)}`;
@@ -390,7 +412,6 @@ async function runGlobalFactsTaskV2({
     task_id: task.task_id,
     title: '全局事实变量生成',
     summary_enabled: false,
-    auto_validate_json: true,
     prompt,
     output_file: GLOBAL_FACTS_OUTPUT_FILE,
     files,
@@ -405,13 +426,12 @@ async function runGlobalFactsTaskV2({
       [GLOBAL_FACTS_OUTPUT_FILE]: GLOBAL_FACTS_JSON_SCHEMA,
     },
     max_retries: 0,
+    validateOutput: candidate => validateGlobalFactsOutput(candidate.output_content),
     onActivity: publishAgentActivity,
     onCheckpoint: syncAgentCheckpoint,
   });
 
-  const generated = readJson(agentResult.output_content, GLOBAL_FACTS_OUTPUT_FILE);
-  const normalized = normalizeGlobalFactsResponse(generated);
-  validateGlobalFactsResponse(normalized);
+  const normalized = agentResult.validation_result;
 
   publish(`全局事实变量整理完成：${normalized.groups.length} 个大项。`, 95);
   const finalCheckpoint = checkpointTask(
@@ -431,7 +451,7 @@ async function runGlobalFactsTaskV2({
 module.exports = {
   GLOBAL_FACTS_OUTPUT_FILE,
   GLOBAL_FACTS_JSON_SCHEMA,
-  readJson,
+  validateGlobalFactsOutput,
   formatProgressTitle,
   runGlobalFactsTaskV2,
 };

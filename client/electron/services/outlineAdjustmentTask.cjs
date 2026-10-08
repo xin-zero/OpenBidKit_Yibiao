@@ -3,8 +3,7 @@ const { OUTLINE_AGENT_TASK_KEY } = require('./outlineGenerationAgentV2Config.cjs
 const {
   OUTLINE_OUTPUT_FILE,
   OUTLINE_JSON_SCHEMA,
-  buildFinalOutline,
-  readJson,
+  validateOutlineOutput,
   formatProgressTitle,
 } = require('./outlineGenerationTaskV2.cjs');
 
@@ -38,12 +37,12 @@ function createOutlineAdjustmentPrompt(requirement) {
 ${requirement}
 
 请按以下要求完成目录调整：
-1. 先读取 ${OUTLINE_OUTPUT_FILE}，理解当前目录结构，再严格按照用户的调整要求修改目录；与要求无关的目录保持原样，不要顺带重写。
+1. 以当前文件为准，先定位用户要求涉及的节点或事实项，并读取必要上下文。优先使用 edit 局部修改；涉及多个节点或条目的统一调整时，可使用 bash 配合 node、jq 处理。
 2. 修改后仍须保持完整根结构 {"outline":[一级目录节点]}：一级目录包含 attr（从"通用""商务/资信""技术""其他""目录""报价""业绩"中选择），子目录不包含 attr；已有节点 id 原样保留，新节点 id 填 null，由程序分配唯一 ID；数组顺序决定排序，number 是程序计算的显示编号，不得填入 id。
 3. 每个最终叶子节点必须填写 content_mode：技术方案正文为 ai-generate；商务/资信和业绩材料为 template-fill；投标文件目录为 directory-generate；报价为 manual-fill；其他特殊内容为 other，并用 content_mode_note 说明。父节点只包含 children，不包含 content_mode 或 content_mode_note。
 4. 任意非叶子节点的 children 至少包含两个节点，目录最多六级；title 只写纯标题，不包含章节编号或 Markdown 标记。
 5. 如果用户要求含糊或存在多种理解，选择最符合投标文件专业惯例的做法直接执行，不要调用 ask-user 反复确认；只有当要求明显违反上述结构规则且无法合理变通时，才在最终回复中说明未执行的部分及原因。
-6. 将调整后的完整目录覆盖写回 ${OUTLINE_OUTPUT_FILE}。程序已为该文件预置 Schema，写入后调用 json-validation，只传 {"file_path":"${OUTLINE_OUTPUT_FILE}"}；校验失败后必须先修改文件，再重新校验。
+6. 将调整结果保存到 ${OUTLINE_OUTPUT_FILE}，保存后保持完整文件结构和未涉及内容。程序已为该文件预置 Schema，写入后调用 json-validation，只传 {"file_path":"${OUTLINE_OUTPUT_FILE}"}；校验失败后必须先修改文件，再重新校验。
 7. 全部完成后，用简体中文输出一段简短的最终总结（不超过 200 字，不使用 Markdown 标题），说明本次实际做了哪些目录调整；如有未能执行的要求，一并说明原因。该总结会直接展示给用户。`;
 }
 
@@ -87,7 +86,6 @@ async function runOutlineAdjustmentTask({ agentService, workspaceStore, updateTa
     error: null,
   });
 
-  let adjustedOutline;
   const agentResult = await agentService.runTask({
     task_id: task.task_id,
     title: '技术方案目录 AI 调整',
@@ -107,11 +105,10 @@ async function runOutlineAdjustmentTask({ agentService, workspaceStore, updateTa
     max_retries: 0,
     onActivity: publishAgentActivity,
     validateOutput(candidate) {
-      adjustedOutline = buildFinalOutline(readJson(candidate.output_content, OUTLINE_OUTPUT_FILE), collectOutlineIds(storedPlan.outlineData.outline));
-      return adjustedOutline;
+      return validateOutlineOutput(candidate.output_content, collectOutlineIds(storedPlan.outlineData.outline), { checkSchema: false });
     },
     async continueTask(_candidate, meta) {
-      await meta.writeFiles([{ path: OUTLINE_OUTPUT_FILE, content: JSON.stringify(adjustedOutline, null, 2) }]);
+      await meta.writeFiles([{ path: OUTLINE_OUTPUT_FILE, content: JSON.stringify(meta.validation_result, null, 2) }]);
       return { complete: true };
     },
   });
@@ -121,7 +118,7 @@ async function runOutlineAdjustmentTask({ agentService, workspaceStore, updateTa
   // 目录调整属于目录变更，saveOutline(replace) 会按既有规则清空旧正文与生成缓存。
   const saved = workspaceStore.saveOutline({
     outlineData: {
-      ...adjustedOutline,
+      ...agentResult.validation_result,
       project_name: storedPlan.outlineData.project_name,
       project_overview: storedPlan.outlineData.project_overview,
     },

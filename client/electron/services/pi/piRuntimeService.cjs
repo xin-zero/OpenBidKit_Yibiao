@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { getDeveloperLogsDir } = require('../../utils/paths.cjs');
+const { getAiRequestActivity, runWithAiRequestActivity, notifyAiResponse } = require('../../utils/aiRequestActivity.cjs');
 const { createAgentOpenAiProxy } = require('../agent/agentOpenAiProxy.cjs');
 const { isExpectedAgentInterruption, resolveAgentAbortReason } = require('../agent/agentInterruption.cjs');
 const { trackAgentRuntime } = require('../agent/agentRuntimeAnalytics.cjs');
@@ -9,6 +10,8 @@ const { preparePiEnvironment } = require('./piEnvironment.cjs');
 const { restorePiErrorMessage } = require('./piRetryErrorNormalizer.cjs');
 const { createPiSession, loadPiModules } = require('./piSessionFactory.cjs');
 const { AGENT_REPORTED_FAILURE_CODE } = require('./piTaskFailureTool.cjs');
+const { createWorkspaceBaseline } = require('./piWorkspaceBaseline.cjs');
+const { createSubmissionPolicy, buildSubmissionRepairPrompt } = require('./piSubmissionPolicy.cjs');
 const {
   createPersistentAgentTask,
   getPersistentAgentSessionPath,
@@ -36,7 +39,11 @@ const DEFAULT_NORMAL_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_PI_HTTP_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_RETRIES = 3;
+// Runtime 写入的输入文件所在的受保护分组。
+const INPUT_BASELINE_GROUP = 'inputs';
 const STATUS_TICK_MS = 1000;
+// 达到 max_turns_per_prompt 时的错误码；该错误不进入执行重试续跑。
+const AGENT_TURN_LIMIT_CODE = 'AGENT_TURN_LIMIT';
 const SELF_CHECK_OUTPUT_FILE = 'agent-self-check-result.json';
 const SELF_CHECK_OUTPUT_SCHEMA = {
   type: 'object',
@@ -206,17 +213,18 @@ function getAssistantErrorDetails(messages = []) {
 }
 
 function buildRetryPrompt(outputFile, error, attempt, maxRetries) {
-  return `上一轮执行未通过程序校验或执行失败：${compactText(error?.message || error, 800)}
+  return `上一轮执行失败：${compactText(error?.message || error, 800)}
 
 本次结果文件：${outputFile}。在当前会话和工作区中，根据上述错误修复该文件。继续遵守当前阶段的可修改范围、工具权限及完成条件；已有文件优先局部修正，不因重试扩大修改范围或重新执行已完成阶段。
 这是第 ${attempt}/${maxRetries} 次自动修复机会。`;
 }
 
-function createRetrySummary(attempt, error, outputContent) {
+// 记录一次实际发送的修复提示，执行异常和提交报告共用原有重试诊断。
+function createRetrySummary(attempt, message, outputContent) {
   return {
     attempt,
     at: nowIso(),
-    error: compactText(error?.message || error, 600),
+    error: compactText(message, 600),
     output_chars: String(outputContent || '').length,
   };
 }
@@ -304,7 +312,8 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     };
   }
 
-  function getStatus() {
+  // 聚合子任务时跳过共享队列查询，避免每个子任务重复同步读取模型配置。
+  function getStatus({ includeProxyStatus = true } = {}) {
     return {
       phase,
       healthy,
@@ -317,7 +326,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
       active_task: getActiveTaskSummary(),
       queued_count: 0,
       queued_tasks: [],
-      proxy: proxy?.getStatus?.() || { active: 0, queued: 0, limit: 0 },
+      proxy: (includeProxyStatus ? proxy?.getStatus?.() : null) || { active: 0, queued: 0, limit: 0 },
       runtime_details: {
         sdk_version: sdkVersion,
         runtime_root: layout.runtimeRoot,
@@ -326,8 +335,9 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     };
   }
 
+  // 推送只通知状态变化；共享 AI 队列状态由 agentService 汇总时统一读取一次。
   function emitStatus() {
-    const status = getStatus();
+    const status = getStatus({ includeProxyStatus: false });
     listeners.forEach((listener) => {
       try { listener(status); } catch {}
     });
@@ -385,6 +395,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
           task_token: activeTask.task_token,
           task_id: activeTask.task_id,
           queue_scope_id: activeTask.queue_scope_id,
+          ai_request_activity: activeTask.ai_request_activity,
         } : null,
         verifyLoopback: true,
         loopbackHosts: ['127.0.0.1', '::1', 'localhost'],
@@ -457,7 +468,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
           message: compactText(completedText, 200),
           source: 'pi.message',
           visible: Boolean(completedText),
-          activity: true,
+          activity: false,
         });
         return;
       }
@@ -607,8 +618,8 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     }, 2000);
   }
 
-  // 暂停当前工具调用并等待 Renderer 返回用户答案。
-  async function waitForUserQuestion(request, signal, taskToken) {
+  // 暂停当前工具调用并等待 Renderer 返回用户答案；终止确认不进入业务可读的提问记录。
+  async function waitForUserQuestion(request, signal, taskToken, { recordAnswer = true } = {}) {
     if (!activeTask || activeTask.task_token !== taskToken) {
       throw new Error('当前 Agent 任务已结束，无法继续提问');
     }
@@ -622,7 +633,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
       visible: true,
       activity: true,
     });
-    let answered = false;
+    let settledMessage = '';
     try {
       const result = await requestUserQuestion({
         ...request,
@@ -630,7 +641,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         session_id: activeTask.session_id || '',
         task_title: activeTask.title,
       }, signal);
-      if (activeTask?.task_token === taskToken) {
+      if (recordAnswer && activeTask?.task_token === taskToken) {
         activeTask.user_question_answers.push({
           workflow_stage: workflowStage,
           question: String(request.question || ''),
@@ -640,17 +651,19 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
           answered_at: nowIso(),
         });
       }
-      answered = true;
+      settledMessage = recordAnswer
+        ? '已收到回答，Agent 正在继续执行'
+        : `终止确认：用户选择“${String(result.selected_option || '')}”`;
       return result;
     } finally {
       if (activeTask?.task_token === taskToken) {
         activeTask.waiting_for_user = false;
         touchActivity({
           task_token: taskToken,
-          stage: answered ? 'running' : activeTask.stage,
-          message: answered ? '已收到回答，Agent 正在继续执行' : '',
+          stage: settledMessage ? 'running' : activeTask.stage,
+          message: settledMessage,
           source: 'pi.user-question.settled',
-          visible: answered,
+          visible: Boolean(settledMessage),
           activity: true,
         });
       }
@@ -700,18 +713,34 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     }
   }
 
-  // 执行单个 Pi Agent 任务，并保持业务输出协议一致。
+  // 为本轮 Agent 建立 AI 请求归属；子任务自动继承进入时的父任务上下文。
   async function runTask(payload = {}) {
+    const parentActivity = getAiRequestActivity();
+    const taskToken = crypto.randomUUID();
+    const aiActivity = {
+      onResponse() {
+        if (activeTask?.task_token !== taskToken || !activeController || activeController.signal.aborted) return;
+        // AI 响应只刷新空闲时间，不重复经过业务进度回调；状态沿用每秒推送。
+        activeTask.last_activity_at = nowIso();
+        notifyAiResponse(parentActivity);
+      },
+    };
+    return runWithAiRequestActivity(aiActivity, () => executeTask(payload, taskToken, aiActivity));
+  }
+
+  // 执行单个 Pi Agent 任务，并保持业务输出协议一致。
+  async function executeTask(payload, taskToken, aiActivity) {
     if (activeTask) throw new Error(`${runtimeName} 正在执行其他任务`);
     const taskId = payload.task_id || crypto.randomUUID();
     const title = payload.title || '易标智能体任务';
     const outputFile = payload.output_file || 'agent-result.md';
     const timeoutMs = normalizeTimeoutMs(payload.timeout_ms);
     const maxRetries = normalizeMaxRetries(payload.max_retries);
+    // 每条提示词之后最多执行的轮数，0 表示不限制；目前由 agentService 为子代理统一设置。
+    const maxTurnsPerPrompt = Math.max(0, Math.floor(Number(payload.max_turns_per_prompt) || 0));
     const summaryEnabled = payload.summary_enabled !== false;
     const retryAttempts = [];
     const modelRetryStats = { count: 0 };
-    const taskToken = crypto.randomUUID();
     const startedAt = nowIso();
     const persistentConfig = payload.persistent_task && typeof payload.persistent_task === 'object'
       ? payload.persistent_task
@@ -751,6 +780,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
       last_activity_at: startedAt,
       last_progress_at: startedAt,
       task_token: taskToken,
+      ai_request_activity: aiActivity,
       onActivity: payload.onActivity,
       onCheckpoint: payload.onCheckpoint,
       waiting_for_user: false,
@@ -780,15 +810,29 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     let session = null;
     let sessionSnapshot = null;
     let unsubscribe = null;
+    let unsubscribeTurnLimit = null;
     let archivedWorkspace = '';
     let retainTransientWorkspace = false;
     const diffEntries = [];
     const cleanupAbort = bindAbort(payload.signal, activeController, () => session);
     const watchdog = startWatchdog(activeController, timeoutMs, taskToken);
 
+    // 受保护文件原件放在工作区外；持久任务随任务目录保存，普通任务每次重新登记。
+    const baselineDir = persistentTask ? path.join(persistentTask.paths.taskRoot, 'baseline') : path.join(transientTaskDir, 'baseline');
+    let baseline = null;
+    // Agent 结果文件不登记保护，其余由 Runtime 写入的输入文件被改动后在提交校验前还原。
+    const agentOutputFiles = [outputFile, ...(payload.prepare_output_files || []), ...Object.keys(payload.json_validation_schemas || {})];
+    const writeInputFiles = async (files = [], outputFiles = []) => {
+      await writeWorkspaceFilesAsync(workspaceDir, files);
+      const excluded = new Set([...agentOutputFiles, ...outputFiles].map(safeRelativePath));
+      baseline.protect(INPUT_BASELINE_GROUP, files.map(file => safeRelativePath(file.path)).filter(file => !excluded.has(file)));
+    };
+
     try {
       if (!persistentTask && !sharedWorkspace) await clearDirectoryAsync(workspaceDir);
-      await writeWorkspaceFilesAsync(workspaceDir, payload.files || []);
+      if (!persistentTask) await fs.promises.rm(baselineDir, { recursive: true, force: true });
+      baseline = createWorkspaceBaseline({ workspaceDir, baselineDir });
+      await writeInputFiles(payload.files || []);
       await prepareOutputFilesAsync(workspaceDir, payload.prepare_output_files);
       await ensureStarted();
       const created = await createPiSession({
@@ -801,9 +845,12 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         timeoutMs: DEFAULT_PI_HTTP_IDLE_TIMEOUT_MS,
         jsonValidationSchemas: payload.json_validation_schemas,
         summaryEnabled,
-        autoValidateJson: payload.auto_validate_json === true,
         isFinalToolCall: payload.is_final_tool_call,
         requestUserQuestion: (request, signal) => waitForUserQuestion(request, signal, taskToken),
+        // 失败交回父 Agent 的子会话直接报告失败；其余 Agent 请求终止须经用户确认。
+        requestTerminationDecision: payload.failure_handled_by_parent === true
+          ? null
+          : (request, signal) => waitForUserQuestion(request, signal, taskToken, { recordAnswer: false }),
         reportTaskFailure: (reason) => {
           const error = new Error(String(reason || '').trim() || 'Agent 无法继续当前任务');
           error.code = AGENT_REPORTED_FAILURE_CODE;
@@ -814,7 +861,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         activeTools: payload.active_tools,
         fixedToolList: payload.fixed_tool_list === true,
         beforeToolCall: payload.before_tool_call,
-        beforeFileWrite: payload.before_file_write,
+        baseline,
       });
       session = created.session;
       sessionSnapshot = created.snapshot;
@@ -843,11 +890,26 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         });
       }
       unsubscribe = subscribeSession(session, taskToken, diffEntries, modelRetryStats);
+      // 发送提示词前清零，压缩不清零；第 maxTurnsPerPrompt + 1 轮开始时中止本次任务。
+      let turnsInPrompt = 0;
+      if (maxTurnsPerPrompt) {
+        unsubscribeTurnLimit = session.subscribe((event) => {
+          if (event.type !== 'turn_start' || activeController.signal.aborted) return;
+          turnsInPrompt += 1;
+          if (turnsInPrompt <= maxTurnsPerPrompt) return;
+          const error = new Error(`子代理在一次任务提示后已连续执行 ${maxTurnsPerPrompt} 轮仍未结束，已停止本次子任务`);
+          error.code = AGENT_TURN_LIMIT_CODE;
+          touchActivity({ task_token: taskToken, stage: 'turn_limit', message: error.message, source: 'pi.turn-limit', visible: true, activity: false });
+          activeController.abort(error);
+        });
+      }
       let assistantText = '';
       let validationResult = null;
       let retryCount = 0;
       let stageIndex = Number(payload.initial_stage_index || persistentTask?.state.stage_index || 0);
       let stagePrompt = prompt;
+      let submission = createSubmissionPolicy();
+      const acceptedSubmissionIssues = [];
 
       const createWorkflowMeta = () => ({
         stage: stageIndex,
@@ -864,21 +926,172 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         }),
         user_question_answers: activeTask.user_question_answers.map((item) => ({ ...item })),
         readFile: async (filePath) => (await readOutputAsync(workspaceDir, filePath)).content,
-        writeFiles: async (files) => writeWorkspaceFilesAsync(workspaceDir, files),
+        writeFiles: async (files) => writeInputFiles(files),
+        baseline,
         waitForUser: (waiter, waitMessage, waitState) => waitForExternalUser(waiter, waitMessage, taskToken, waitState),
       });
 
+      // 阶段交接压缩：开始前登记待补压缩，成功或无需压缩时清除；可选压缩失败或被中断时保留，续跑在该阶段要求发出前补做。
+      let pendingCompactionStage = persistentTask?.state.compaction_pending?.stage || '';
+      const runStageCompaction = async (targetStage, options = {}) => {
+        const pending = {
+          stage: targetStage,
+          compaction_stage: options.compaction_stage || `${targetStage}_compaction`,
+          compaction_instructions: options.compaction_instructions,
+          compaction_message: options.compaction_message,
+          compaction_complete_message: options.compaction_complete_message,
+          compaction_optional: options.compaction_optional === true,
+        };
+        const compactionStage = pending.compaction_stage;
+        activeTask.workflow_stage = compactionStage;
+        pendingCompactionStage = targetStage;
+        checkpointPersistentTask({
+          status: 'running',
+          phase: compactionStage,
+          agent_connection: 'running',
+          compaction_pending: pending,
+        });
+        touchActivity({
+          task_token: taskToken,
+          stage: compactionStage,
+          message: pending.compaction_message || 'Agent 正在压缩上下文',
+          source: 'pi.workflow.compaction',
+          visible: true,
+          activity: true,
+        });
+        let completed = false;
+        try {
+          await session.compact(pending.compaction_instructions);
+          if (activeController.signal.aborted) throw activeController.signal.reason;
+          completed = true;
+          touchActivity({
+            task_token: taskToken,
+            stage: compactionStage,
+            message: pending.compaction_complete_message || 'Agent 上下文压缩完成',
+            source: 'pi.workflow.compaction.completed',
+            visible: true,
+            activity: true,
+          });
+        } catch (error) {
+          if (activeController.signal.aborted) throw activeController.signal.reason;
+          const noop = isCompactionNoopError(error);
+          // 可选压缩只用于缩减上下文，失败时保留原上下文继续下一阶段。
+          if (!noop && !pending.compaction_optional) throw error;
+          completed = noop;
+          touchActivity({
+            task_token: taskToken,
+            stage: compactionStage,
+            message: noop ? '当前上下文无需压缩，继续执行下一阶段' : `上下文压缩失败，按原上下文继续：${compactText(error?.message || error, 160)}`,
+            source: noop ? 'pi.workflow.compaction.skipped' : 'pi.workflow.compaction.failed',
+            visible: true,
+            activity: true,
+          });
+        }
+        if (completed) pendingCompactionStage = '';
+        activeTask.workflow_stage = targetStage;
+        checkpointPersistentTask({
+          status: 'running',
+          phase: targetStage,
+          agent_connection: 'running',
+          ...(completed ? { compaction_pending: null } : {}),
+        });
+      };
+
+      // 续跑时该阶段要求尚未发出而交接压缩未完成（失败或被暂停），先补做压缩再发送阶段要求。
+      const resumePendingCompaction = persistentConfig?.mode === 'resume' ? persistentTask?.state.compaction_pending : null;
+      if (resumePendingCompaction?.stage === activeTask.workflow_stage && persistentTask.state.prompted_stage !== activeTask.workflow_stage) {
+        await runStageCompaction(activeTask.workflow_stage, resumePendingCompaction);
+      }
+
+      // 提交校验前先还原被改动的受保护文件，再按任务规则校验结果；还原本身不算校验失败。
+      const checkSubmission = async (attempt) => {
+        const restored = baseline.restore();
+        if (restored.length) {
+          touchActivity({
+            task_token: taskToken,
+            stage: activeTask.workflow_stage,
+            message: `已还原 ${restored.length} 个被改动的程序文件：${compactText(restored.join('、'), 200)}`,
+            source: 'pi.baseline.restored',
+            visible: true,
+            activity: true,
+          });
+        }
+        const output = await readOutputAsync(workspaceDir, outputFile);
+        checkpointPersistentTask({
+          status: 'running',
+          phase: activeTask.workflow_stage,
+          agent_connection: 'running',
+          session_file: session.sessionFile ? path.basename(session.sessionFile) : persistentTask?.state.session_file || '',
+        });
+        const nextCandidate = {
+          success: true,
+          runtime_id: runtimeId,
+          task_id: taskId,
+          title,
+          output_file: outputFile,
+          output_content: output.content,
+          assistant_text: assistantText,
+          session_id: session.sessionId,
+          retry_count: retryAttempts.length,
+          retry_attempts: [...retryAttempts],
+          model_retry_count: modelRetryStats.count,
+        };
+        const report = typeof payload.validateOutput === 'function'
+          ? await payload.validateOutput(nextCandidate, {
+            attempt,
+            ...createWorkflowMeta(),
+            retry_attempts: [...retryAttempts],
+          })
+          : { value: null, issues: [] };
+        return { candidate: nextCandidate, report, restored };
+      };
+
+      // 两类修复共用既有活动、监控及重试记录；提交修复没有固定次数上限。
+      const recordRetry = (message, outputContent, retryPrompt, maximum) => {
+        retryAttempts.push(createRetrySummary(retryAttempts.length + 1, message, outputContent));
+        retryCount = retryAttempts.length;
+        touchActivity({
+          task_token: taskToken,
+          stage: 'retry',
+          message: `${runtimeName} 正在自动修复：${compactText(message, 160)}`,
+          source: 'pi.retry',
+          visible: true,
+          activity: true,
+        });
+        stagePrompt = retryPrompt;
+        emitMonitorEvent({
+          type: 'retry',
+          task_id: taskId,
+          title,
+          attempt: retryCount,
+          ...(maximum === undefined ? {} : { maximum }),
+          message: compactText(message, 600),
+          prompt: stagePrompt,
+        });
+      };
+
       while (true) {
         let candidate = null;
-        for (let attemptIndex = 0; attemptIndex <= maxRetries; attemptIndex += 1) {
+        let acceptedIssues = [];
+        // 执行异常只使用原 max_retries，提交策略在同一业务阶段的续接中保持。
+        let executionRetries = 0;
+        while (true) {
+          let report;
+          let restored;
           try {
             if (activeController.signal.aborted) throw activeController.signal.reason;
             activeTask.stage_index = stageIndex;
+            // prompted_stage 记录已发给 Agent 的阶段，续跑据此只发送“继续之前的任务”；阶段要求发出后不再补做该阶段的交接压缩。
+            const clearsPendingCompaction = pendingCompactionStage === activeTask.workflow_stage;
+            if (clearsPendingCompaction) pendingCompactionStage = '';
             checkpointPersistentTask({
               status: 'running',
               phase: activeTask.workflow_stage,
               agent_connection: 'running',
+              prompted_stage: activeTask.workflow_stage,
+              ...(clearsPendingCompaction ? { compaction_pending: null } : {}),
             });
+            turnsInPrompt = 0;
             await session.prompt(stagePrompt, { expandPromptTemplates: false });
             if (activeController.signal.aborted) throw activeController.signal.reason;
             const assistantError = getAssistantError(session.messages);
@@ -887,86 +1100,65 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
               error.piAssistantError = getAssistantErrorDetails(session.messages);
               throw error;
             }
-            created.assertJsonValidationPassed();
             assistantText = summaryEnabled ? extractAssistantText(session.messages) : '';
-            const output = await readOutputAsync(workspaceDir, outputFile);
-            checkpointPersistentTask({
-              status: 'running',
-              phase: activeTask.workflow_stage,
-              agent_connection: 'running',
-              session_file: session.sessionFile ? path.basename(session.sessionFile) : persistentTask?.state.session_file || '',
-            });
-            candidate = {
-              success: true,
-              runtime_id: runtimeId,
-              task_id: taskId,
-              title,
-              output_file: outputFile,
-              output_content: output.content,
-              assistant_text: assistantText,
-              session_id: session.sessionId,
-              retry_count: retryAttempts.length,
-              retry_attempts: [...retryAttempts],
-              model_retry_count: modelRetryStats.count,
-            };
-            if (typeof payload.validateOutput === 'function') {
-              try {
-                validationResult = await payload.validateOutput(candidate, {
-                  attempt: attemptIndex + 1,
-                  stage: stageIndex,
-                  workflow_stage: activeTask.workflow_stage,
-                  max_retries: maxRetries,
-                  task_id: taskId,
-                  title,
-                  output_file: outputFile,
-                  workspace_dir: workspaceDir,
-                  session_id: session.sessionId,
-                  retry_attempts: [...retryAttempts],
-                  readFile: createWorkflowMeta().readFile,
-                });
-              } catch (validationError) {
-                if (validationError && typeof validationError === 'object') {
-                  validationError.agentValidationFailed = true;
-                }
-                throw validationError;
-              }
-            }
-            retryCount = retryAttempts.length;
-            break;
+            ({ candidate, report, restored } = await checkSubmission(submission.attempts + 1));
           } catch (error) {
             if (activeController.signal.aborted) throw activeController.signal.reason || error;
-            if (attemptIndex >= maxRetries) throw error;
+            if (executionRetries >= maxRetries) throw error;
+            executionRetries += 1;
             const retryPrompt = typeof payload.buildRetryPrompt === 'function'
-              ? await payload.buildRetryPrompt(error, {
+              ? await payload.buildRetryPrompt({ kind: 'execution', error }, {
                 ...createWorkflowMeta(),
-                attempt: attemptIndex + 1,
+                attempt: executionRetries,
                 max_retries: maxRetries,
                 retry_attempts: [...retryAttempts],
               })
-              : buildRetryPrompt(outputFile, error, attemptIndex + 1, maxRetries);
+              : buildRetryPrompt(outputFile, error, executionRetries, maxRetries);
             if (retryPrompt === null) throw error;
             const output = await readOutputAsync(workspaceDir, outputFile);
-            retryAttempts.push(createRetrySummary(retryAttempts.length + 1, error, output.content));
-            retryCount = retryAttempts.length;
-            touchActivity({
-              task_token: taskToken,
-              stage: 'retry',
-              message: `${runtimeName} 正在自动修复：${compactText(error?.message || error, 160)}`,
-              source: 'pi.retry',
-              visible: true,
-              activity: true,
-            });
-            stagePrompt = retryPrompt;
-            emitMonitorEvent({
-              type: 'retry',
-              task_id: taskId,
-              title,
-              attempt: retryCount,
-              maximum: maxRetries,
-              message: compactText(error?.message || error, 600),
-              prompt: stagePrompt,
-            });
+            recordRetry(error?.message || String(error), output.content, retryPrompt, maxRetries);
+            continue;
           }
+
+          // 预期产物问题由报告决定；停止决策在执行 catch 之外，不消耗执行重试预算。
+          const decision = submission.inspect(report);
+          if (decision.action === 'stop') {
+            const blocking = report.issues.filter(issue => issue.severity === 'blocking');
+            const error = new Error(`已按最低完成目标再修复一轮，仍存在阻塞流程的问题，任务已停止：\n${blocking.map(issue => issue.message).join('\n')}`);
+            error.agentValidationFailed = true;
+            error.issues = report.issues;
+            throw error;
+          }
+          if (decision.action === 'accept') {
+            validationResult = report.value;
+            acceptedIssues = report.issues;
+            if (acceptedIssues.length) {
+              acceptedSubmissionIssues.push({ stage: activeTask.workflow_stage, issues: acceptedIssues });
+              touchActivity({
+                task_token: taskToken,
+                stage: activeTask.workflow_stage,
+                message: `仍有 ${acceptedIssues.length} 项质量问题，保留当前结果继续后续流程：${compactText(acceptedIssues.map(issue => issue.message).join('；'), 200)}`,
+                source: 'pi.submission.accepted',
+                visible: true,
+                activity: true,
+              });
+            }
+            break;
+          }
+
+          const businessPrompt = typeof payload.buildRetryPrompt === 'function'
+            ? await payload.buildRetryPrompt({ kind: 'submission', report, mode: decision.mode }, {
+              ...createWorkflowMeta(),
+              attempt: decision.attempt,
+              retry_attempts: [...retryAttempts],
+            })
+            : `本次结果文件：${outputFile}。在当前会话和工作区修复，保留已完成内容。`;
+          const repairDetails = [
+            restored.length ? `程序已还原被改动的文件：${restored.join('、')}。这些文件由程序维护，不要修改。` : '',
+            businessPrompt,
+          ].filter(Boolean).join('\n');
+          const retryPrompt = buildSubmissionRepairPrompt(report, decision, repairDetails);
+          recordRetry(report.issues.map(issue => issue.message).join('\n'), candidate.output_content, retryPrompt);
         }
 
         if (typeof payload.continueTask !== 'function') break;
@@ -975,6 +1167,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         const continuation = await payload.continueTask(candidate, {
           ...createWorkflowMeta(),
           validation_result: validationResult,
+          accepted_issues: acceptedIssues,
         });
         if (!continuation || continuation.complete === true || !continuation.prompt) break;
         emitMonitorEvent({
@@ -989,7 +1182,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         });
         const continuationFiles = Array.isArray(continuation.files) ? continuation.files : [];
         if (continuationFiles.length) {
-          await writeWorkspaceFilesAsync(workspaceDir, continuationFiles);
+          await writeInputFiles(continuationFiles, continuation.prepare_output_files || []);
         }
         await prepareOutputFilesAsync(workspaceDir, continuation.prepare_output_files);
         stageIndex = Number.isFinite(Number(continuation.stage_index))
@@ -997,59 +1190,13 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
           : stageIndex + 1;
         activeTask.stage_index = stageIndex;
         const continuationStage = continuation.stage || `workflow_stage_${stageIndex}`;
+        if (continuationStage !== completedWorkflowStage) submission = createSubmissionPolicy();
         activeTask.workflow_stage = continuationStage;
         stagePrompt = continuation.prompt;
         // 与压缩并行的程序步骤：先登记错误处理，压缩结束后再等待其完成，之后才发送提示词。
         const beforePrompt = continuation.await_before_prompt ? Promise.resolve(continuation.await_before_prompt) : null;
         beforePrompt?.catch(() => {});
-        if (continuation.compact_before_prompt === true) {
-          const compactionStage = continuation.compaction_stage || `${continuationStage}_compaction`;
-          activeTask.workflow_stage = compactionStage;
-          checkpointPersistentTask({
-            status: 'running',
-            phase: compactionStage,
-            agent_connection: 'running',
-          });
-          touchActivity({
-            task_token: taskToken,
-            stage: compactionStage,
-            message: continuation.compaction_message || 'Agent 正在压缩上下文',
-            source: 'pi.workflow.compaction',
-            visible: true,
-            activity: true,
-          });
-          try {
-            await session.compact(continuation.compaction_instructions);
-            if (activeController.signal.aborted) throw activeController.signal.reason;
-            touchActivity({
-              task_token: taskToken,
-              stage: compactionStage,
-              message: continuation.compaction_complete_message || 'Agent 上下文压缩完成',
-              source: 'pi.workflow.compaction.completed',
-              visible: true,
-              activity: true,
-            });
-          } catch (error) {
-            if (activeController.signal.aborted) throw activeController.signal.reason;
-            const noop = isCompactionNoopError(error);
-            // 可选压缩只用于缩减上下文，失败时保留原上下文继续下一阶段。
-            if (!noop && continuation.compaction_optional !== true) throw error;
-            touchActivity({
-              task_token: taskToken,
-              stage: compactionStage,
-              message: noop ? '当前上下文无需压缩，继续执行下一阶段' : `上下文压缩失败，按原上下文继续：${compactText(error?.message || error, 160)}`,
-              source: noop ? 'pi.workflow.compaction.skipped' : 'pi.workflow.compaction.failed',
-              visible: true,
-              activity: true,
-            });
-          }
-          activeTask.workflow_stage = continuationStage;
-          checkpointPersistentTask({
-            status: 'running',
-            phase: continuationStage,
-            agent_connection: 'running',
-          });
-        }
+        if (continuation.compact_before_prompt === true) await runStageCompaction(continuationStage, continuation);
         if (beforePrompt) {
           try {
             await beforePrompt;
@@ -1058,6 +1205,10 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
             throw error;
           }
           if (activeController.signal.aborted) throw activeController.signal.reason;
+          // 与程序步骤并行的压缩可能被其批量请求挤占而失败（如排队后被限流），程序步骤结束后在发出阶段要求前补做一次；仍失败按原上下文继续。
+          if (continuation.compact_before_prompt === true && pendingCompactionStage === continuationStage) {
+            await runStageCompaction(continuationStage, { ...continuation, compaction_message: '上下文压缩未完成，正在重新压缩' });
+          }
         }
         emitMonitorEvent({
           type: 'task_input',
@@ -1098,6 +1249,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         retry_attempts: retryAttempts,
         model_retry_count: modelRetryStats.count,
         validation_result: validationResult,
+        accepted_submission_issues: acceptedSubmissionIssues,
         diagnostics: {
           session: sessionSnapshot,
           events: diagnostics.events.filter((event) => String(event.at || '') >= startedAt),
@@ -1185,6 +1337,7 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
       throw error;
     } finally {
       unsubscribe?.();
+      unsubscribeTurnLimit?.();
       session?.dispose?.();
       cleanupAbort();
       clearInterval(watchdog);
