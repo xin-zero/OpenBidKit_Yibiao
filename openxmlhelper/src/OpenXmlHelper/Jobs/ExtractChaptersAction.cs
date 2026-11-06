@@ -1,8 +1,10 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
+using Yibiao.OpenXmlHelper.Ooxml;
 using Wp = DocumentFormat.OpenXml.Wordprocessing;
 
 namespace Yibiao.OpenXmlHelper.Jobs;
@@ -15,6 +17,12 @@ sealed class ExtractChapterSpec
     public string Source { get; set; } = "";
     public int? StartBlock { get; set; }
     public int? EndBlock { get; set; }
+    /// <summary>章节字段是否自动填写；为 false 时写入字段时统一改为人工。</summary>
+    [JsonPropertyName("auto_fill")]
+    public bool? AutoFill { get; set; }
+    /// <summary>规则和页码章节；扫描时为其提供表格位置候选，并允许 fill_by=rule。</summary>
+    [JsonPropertyName("rule_page")]
+    public bool? RulePage { get; set; }
 }
 
 sealed class ExtractChaptersRequest
@@ -29,7 +37,6 @@ sealed class ExtractChaptersRequest
 static class ExtractChaptersAction
 {
     public const string Name = "extract-chapters";
-    const string RelationshipNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
     static readonly Regex PrefixPattern = new(
         @"^(第[一二三四五六七八九十百千零0-9]+[章节篇部分]|[0-9]+[\.、．])\s*",
@@ -59,6 +66,8 @@ static class ExtractChaptersAction
                     Source = (item.Source ?? "").Trim(),
                     StartBlock = item.StartBlock,
                     EndBlock = item.EndBlock,
+                    AutoFill = item.AutoFill,
+                    RulePage = item.RulePage,
                 })
                 .Where(item => item.Title.Length > 0)
                 .ToList();
@@ -91,39 +100,36 @@ static class ExtractChaptersAction
                 }
 
                 var shellPath = sourcePaths[0];
-                File.Copy(shellPath, outputPath, overwrite: true);
+                WordWorkspace.CopyToWritable(shellPath, outputPath);
 
                 using var dest = WordprocessingDocument.Open(outputPath, true);
                 var destPart = dest.MainDocumentPart ?? throw new InvalidOperationException("投标模版缺少正文部件");
                 var destBody = destPart.Document.Body ?? throw new InvalidOperationException("投标模版正文为空");
                 var sectPr = destBody.Elements<Wp.SectionProperties>().LastOrDefault()?.CloneNode(true);
-                destBody.RemoveAllChildren();
+                WordStructure.ClearContent(destBody);
                 var importContexts = new Dictionary<string, CrossDocumentImportContext>(StringComparer.OrdinalIgnoreCase);
                 var chapterRanges = new List<TemplateChapterRange>();
 
-                foreach (var match in matches)
+                var ranges = matches.Select(match =>
                 {
                     var hit = match.Hit!;
-                    var source = session[hit.SourcePath];
                     var otherStarts = matches
                         .Where(item => WordWorkspace.PathsEqual(item.Hit!.SourcePath, hit.SourcePath))
                         .Select(item => item.Hit!.BlockIndex)
                         .ToHashSet();
-                    var range = ExtendRange(
-                        source.Blocks,
-                        match.Range ?? GetRange(source.Blocks, hit.BlockIndex, otherStarts),
-                        otherStarts);
+                    var blocks = session[hit.SourcePath].Blocks;
+                    return (Match: match, Range: ExtendRange(blocks, match.Range ?? GetRange(blocks, hit.BlockIndex, otherStarts), otherStarts));
+                }).ToList();
+                var kept = KeepSelectedBlocks(session, ranges);
+
+                foreach (var (match, range) in ranges)
+                {
+                    var hit = match.Hit!;
+                    var source = session[hit.SourcePath];
                     var startBlock = destBody.ChildElements.Count;
-                    var titleReplaced = false;
                     foreach (var block in range)
                     {
-                        var cloned = CloneLayoutBlock(block);
-                        if (!titleReplaced && cloned is Wp.Paragraph heading && !block.IsLayoutOnly)
-                        {
-                            ReplaceParagraphText(heading, match.Chapter.Title);
-                            titleReplaced = true;
-                        }
-
+                        var cloned = TakeLayoutBlock(block, kept[hit.SourcePath]);
                         if (!WordWorkspace.PathsEqual(hit.SourcePath, shellPath))
                         {
                             if (!importContexts.TryGetValue(hit.SourcePath, out var importContext))
@@ -131,9 +137,9 @@ static class ExtractChaptersAction
                                 importContext = new CrossDocumentImportContext(CreateStyleMap(source.Part, destPart));
                                 importContexts[hit.SourcePath] = importContext;
                             }
-                            NormalizeStyleReferences(cloned, importContext.StyleIds);
-                            RemapNumbering(cloned, source.Part, destPart, importContext);
-                            RemapRelationships(cloned, source.Part, destPart, importContext.RelationshipIds);
+                            CrossDocumentImport.NormalizeStyleReferences(cloned, importContext.StyleIds);
+                            CrossDocumentImport.RemapNumbering(cloned, source.Part, destPart, importContext);
+                            CrossDocumentImport.RemapRelationships(cloned, source.Part, destPart, importContext.RelationshipIds);
                         }
 
                         destBody.AppendChild(cloned);
@@ -142,6 +148,8 @@ static class ExtractChaptersAction
                     {
                         Id = match.Chapter.Id.Length > 0 ? match.Chapter.Id : null,
                         Title = match.Chapter.Title,
+                        AutoFill = match.Chapter.AutoFill ?? true,
+                        RulePage = match.Chapter.RulePage == true ? true : null,
                         StartBlock = startBlock,
                         EndBlock = destBody.ChildElements.Count,
                     });
@@ -152,6 +160,8 @@ static class ExtractChaptersAction
                     destBody.AppendChild(sectPr);
                 }
 
+                // 投标模版不保留招标原件的批注：清空壳文档时批注条目已随标记删除，再去掉各章带进来的批注标记，避免引用指向不存在的批注。
+                WordStructure.RemoveAllComments(destPart);
                 destPart.Document.Save();
                 var chapterRangeFile = new TemplateChapterRangeFile { Chapters = chapterRanges };
                 File.WriteAllText(
@@ -167,6 +177,10 @@ static class ExtractChaptersAction
                     source.Dispose();
                 }
             }
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
+        {
+            return WordWorkspace.FileAccessFailure(workspace, [request.Output, .. request.Sources]);
         }
         catch (Exception exception)
         {
@@ -336,21 +350,48 @@ static class ExtractChaptersAction
         return extended;
     }
 
-    /// <summary>克隆块；中间分节改为分页符，避免打乱整份模版只保留一个节。</summary>
-    static OpenXmlElement CloneLayoutBlock(BlockInfo block)
+    /// <summary>一份来源去掉未选中块之后剩下的克隆：容器和按块号索引的元素。</summary>
+    sealed record KeptBlocks(Wp.Body Container, IReadOnlyDictionary<int, OpenXmlElement> Elements);
+
+    /// <summary>
+    /// 抽章即“只保留选中的块”：每份来源克隆整份正文，按全部选中范围的并集一次删掉其余的块。删除经结构层（取子集方式），
+    /// 跨范围的书签、域、批注不会只剩一半；整对都在未选中部分的书签随之删除，不挪进章节。
+    /// </summary>
+    static Dictionary<string, KeptBlocks> KeepSelectedBlocks(
+        Dictionary<string, SourceDocument> session,
+        IEnumerable<(ChapterMatch Match, List<BlockInfo> Range)> ranges)
+    {
+        var result = new Dictionary<string, KeptBlocks>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in ranges.GroupBy(item => item.Match.Hit!.SourcePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var selected = group.SelectMany(item => item.Range).Select(block => block.BlockIndex).ToHashSet();
+            var clones = session[group.Key].Blocks.Select(block => block.Element.CloneNode(true)).ToList();
+            var container = new Wp.Body(clones);
+            WordStructure.RemoveRange(clones.Where((_, index) => !selected.Contains(index)).ToList(), keepEnclosedBookmarks: false);
+            result[group.Key] = new KeptBlocks(container, selected.ToDictionary(index => index, index => clones[index]));
+        }
+        return result;
+    }
+
+    /// <summary>取出保留下来的块；中间分节改为分页符，避免打乱整份模版只保留一个节。同一块被取用两次时第二次用克隆。</summary>
+    static OpenXmlElement TakeLayoutBlock(BlockInfo block, KeptBlocks kept)
     {
         if (block.Kind == "section-break")
         {
             return CreatePageBreakParagraph();
         }
 
-        var cloned = (OpenXmlElement)block.Element.CloneNode(true);
+        var element = kept.Elements[block.BlockIndex];
+        var cloned = ReferenceEquals(element.Parent, kept.Container) ? WordStructure.Detach(element) : element.CloneNode(true);
+        // 拼写语法检查标记（w:proofErr）不含内容，留着会让字段扫描把所在段落当作复杂段落整段跳过。
+        WordStructure.RemoveRange(cloned.Descendants<Wp.ProofError>().ToList());
+
         if (cloned is Wp.Paragraph paragraph)
         {
             var section = paragraph.ParagraphProperties?.SectionProperties;
             if (section is not null)
             {
-                section.Remove();
+                WordStructure.Remove(section);
                 if (!block.HasPageBreak)
                 {
                     EnsurePageBreak(paragraph);
@@ -376,7 +417,7 @@ static class ExtractChaptersAction
         paragraph.AppendChild(new Wp.Run(new Wp.Break { Type = Wp.BreakValues.Page }));
     }
 
-    static int ScoreTitle(string title, BlockInfo block)
+    internal static int ScoreTitle(string title, BlockInfo block)
     {
         var expected = WordWorkspace.Normalize(title);
         var expectedCore = PrefixPattern.Replace(expected, "").Trim();
@@ -407,36 +448,6 @@ static class ExtractChaptersAction
         }
 
         return score;
-    }
-
-    static void ReplaceParagraphText(Wp.Paragraph paragraph, string text)
-    {
-        var runs = paragraph.Elements<Wp.Run>().ToList();
-        if (runs.Count == 0)
-        {
-            paragraph.AppendChild(new Wp.Run(new Wp.Text(text) { Space = SpaceProcessingModeValues.Preserve }));
-            return;
-        }
-
-        var first = runs[0];
-        var texts = first.Elements<Wp.Text>().ToList();
-        if (texts.Count == 0)
-        {
-            first.AppendChild(new Wp.Text(text) { Space = SpaceProcessingModeValues.Preserve });
-        }
-        else
-        {
-            texts[0].Text = text;
-            for (var index = 1; index < texts.Count; index += 1)
-            {
-                texts[index].Remove();
-            }
-        }
-
-        for (var index = 1; index < runs.Count; index += 1)
-        {
-            runs[index].Remove();
-        }
     }
 
     /** 将外部文档的样式引用映射到第一份 Word 的同 ID 或同名样式。 */
@@ -481,223 +492,6 @@ static class ExtractChaptersAction
         return name.Length == 0 ? "" : $"{style.Type?.Value}:{name}";
     }
 
-    /** 保留基准文档已有样式；找不到对应样式时移除外部样式引用并保留直接格式。 */
-    static void NormalizeStyleReferences(OpenXmlElement cloned, Dictionary<string, string?> styleIds)
-    {
-        foreach (var style in cloned.Descendants<Wp.ParagraphStyleId>().ToList())
-        {
-            ApplyStyleMap(style.Val?.Value, styleIds, value => style.Val = value, style.Remove);
-        }
-        foreach (var style in cloned.Descendants<Wp.RunStyle>().ToList())
-        {
-            ApplyStyleMap(style.Val?.Value, styleIds, value => style.Val = value, style.Remove);
-        }
-        foreach (var style in cloned.Descendants<Wp.TableStyle>().ToList())
-        {
-            ApplyStyleMap(style.Val?.Value, styleIds, value => style.Val = value, style.Remove);
-        }
-        foreach (var style in cloned.Descendants<Wp.StyleLink>().ToList())
-        {
-            ApplyStyleMap(style.Val?.Value, styleIds, value => style.Val = value, style.Remove);
-        }
-        foreach (var style in cloned.Descendants<Wp.NumberingStyleLink>().ToList())
-        {
-            ApplyStyleMap(style.Val?.Value, styleIds, value => style.Val = value, style.Remove);
-        }
-    }
-
-    static void ApplyStyleMap(
-        string? sourceId,
-        Dictionary<string, string?> styleIds,
-        Action<string> apply,
-        Action remove)
-    {
-        if (!string.IsNullOrWhiteSpace(sourceId)
-            && styleIds.TryGetValue(sourceId, out var targetId)
-            && !string.IsNullOrWhiteSpace(targetId))
-        {
-            apply(targetId);
-            return;
-        }
-        remove();
-    }
-
-    /** 为跨文档段落复制独立编号定义，避免 numId 误指向基准文档中的其他列表。 */
-    static void RemapNumbering(
-        OpenXmlElement cloned,
-        MainDocumentPart sourcePart,
-        MainDocumentPart destPart,
-        CrossDocumentImportContext context)
-    {
-        foreach (var properties in cloned.Descendants<Wp.NumberingProperties>().ToList())
-        {
-            var sourceNumberId = properties.NumberingId?.Val?.Value;
-            if (sourceNumberId is null) continue;
-            var targetNumberId = ImportNumbering(sourceNumberId.Value, sourcePart, destPart, context);
-            if (targetNumberId is null)
-            {
-                properties.Remove();
-                continue;
-            }
-            properties.NumberingId!.Val = targetNumberId.Value;
-        }
-    }
-
-    static int? ImportNumbering(
-        int sourceNumberId,
-        MainDocumentPart sourcePart,
-        MainDocumentPart destPart,
-        CrossDocumentImportContext context)
-    {
-        if (context.NumberingIds.TryGetValue(sourceNumberId, out var cached)) return cached;
-        var sourceNumberingPart = sourcePart.NumberingDefinitionsPart;
-        var sourceNumbering = sourceNumberingPart?.Numbering;
-        if (sourceNumberingPart is null || sourceNumbering is null) return null;
-        var sourceInstance = sourceNumbering.Elements<Wp.NumberingInstance>()
-            .FirstOrDefault(item => item.NumberID?.Value == sourceNumberId);
-        var sourceAbstractId = sourceInstance?.AbstractNumId?.Val?.Value;
-        if (sourceInstance is null || sourceAbstractId is null) return null;
-        var sourceAbstract = sourceNumbering.Elements<Wp.AbstractNum>()
-            .FirstOrDefault(item => item.AbstractNumberId?.Value == sourceAbstractId.Value);
-        if (sourceAbstract is null) return null;
-
-        var destNumberingPart = destPart.NumberingDefinitionsPart ?? destPart.AddNewPart<NumberingDefinitionsPart>();
-        destNumberingPart.Numbering ??= new Wp.Numbering();
-        var destNumbering = destNumberingPart.Numbering;
-        var targetAbstractId = destNumbering.Elements<Wp.AbstractNum>()
-            .Select(item => item.AbstractNumberId?.Value ?? -1)
-            .DefaultIfEmpty(-1)
-            .Max() + 1;
-        var targetNumberId = destNumbering.Elements<Wp.NumberingInstance>()
-            .Select(item => item.NumberID?.Value ?? 0)
-            .DefaultIfEmpty(0)
-            .Max() + 1;
-
-        var copiedAbstract = (Wp.AbstractNum)sourceAbstract.CloneNode(true);
-        copiedAbstract.AbstractNumberId = targetAbstractId;
-        NormalizeStyleReferences(copiedAbstract, context.StyleIds);
-        RemapPictureBullets(copiedAbstract, sourceNumberingPart, destNumberingPart, context);
-        var firstInstance = destNumbering.Elements<Wp.NumberingInstance>().FirstOrDefault();
-        if (firstInstance is null) destNumbering.AppendChild(copiedAbstract);
-        else destNumbering.InsertBefore(copiedAbstract, firstInstance);
-
-        var copiedInstance = (Wp.NumberingInstance)sourceInstance.CloneNode(true);
-        copiedInstance.NumberID = targetNumberId;
-        copiedInstance.AbstractNumId ??= new Wp.AbstractNumId();
-        copiedInstance.AbstractNumId.Val = targetAbstractId;
-        destNumbering.AppendChild(copiedInstance);
-        destNumbering.Save();
-        context.NumberingIds[sourceNumberId] = targetNumberId;
-        return targetNumberId;
-    }
-
-    static void RemapPictureBullets(
-        Wp.AbstractNum abstractNum,
-        NumberingDefinitionsPart sourcePart,
-        NumberingDefinitionsPart destPart,
-        CrossDocumentImportContext context)
-    {
-        foreach (var reference in abstractNum.Descendants<Wp.LevelPictureBulletId>().ToList())
-        {
-            var sourceId = reference.Val?.Value;
-            if (sourceId is null) continue;
-            var targetId = ImportPictureBullet(sourceId.Value, sourcePart, destPart, context);
-            if (targetId is null) reference.Remove();
-            else reference.Val = targetId.Value;
-        }
-    }
-
-    static int? ImportPictureBullet(
-        int sourceId,
-        NumberingDefinitionsPart sourcePart,
-        NumberingDefinitionsPart destPart,
-        CrossDocumentImportContext context)
-    {
-        if (context.PictureBulletIds.TryGetValue(sourceId, out var cached)) return cached;
-        var sourceBullet = sourcePart.Numbering?.Elements<Wp.NumberingPictureBullet>()
-            .FirstOrDefault(item => item.NumberingPictureBulletId?.Value == sourceId);
-        if (sourceBullet is null || destPart.Numbering is null) return null;
-        var targetId = destPart.Numbering.Elements<Wp.NumberingPictureBullet>()
-            .Select(item => item.NumberingPictureBulletId?.Value ?? -1)
-            .DefaultIfEmpty(-1)
-            .Max() + 1;
-        var copied = (Wp.NumberingPictureBullet)sourceBullet.CloneNode(true);
-        copied.NumberingPictureBulletId = targetId;
-        RemapRelationships(copied, sourcePart, destPart, context.RelationshipIds);
-        var firstAbstract = destPart.Numbering.Elements<Wp.AbstractNum>().FirstOrDefault();
-        if (firstAbstract is null) destPart.Numbering.PrependChild(copied);
-        else destPart.Numbering.InsertBefore(copied, firstAbstract);
-        context.PictureBulletIds[sourceId] = targetId;
-        return targetId;
-    }
-
-    /** 复制图片、超链接、图表和嵌入对象等关系，并改写克隆内容中的 r:id。 */
-    static void RemapRelationships(
-        OpenXmlElement cloned,
-        OpenXmlPart sourcePart,
-        OpenXmlPart destPart,
-        Dictionary<string, string> relationshipIds)
-    {
-        foreach (var element in SelfAndDescendants(cloned))
-        {
-            foreach (var attribute in element.GetAttributes().ToList())
-            {
-                if (attribute.NamespaceUri != RelationshipNamespace || string.IsNullOrWhiteSpace(attribute.Value)) continue;
-                var cacheKey = $"{sourcePart.Uri}\u0000{attribute.Value}";
-                if (!relationshipIds.TryGetValue(cacheKey, out var targetId))
-                {
-                    targetId = CopyRelationship(sourcePart, destPart, attribute.Value);
-                    relationshipIds[cacheKey] = targetId;
-                }
-                element.SetAttribute(new OpenXmlAttribute(
-                    attribute.Prefix,
-                    attribute.LocalName,
-                    attribute.NamespaceUri,
-                    targetId));
-            }
-        }
-    }
-
-    static string CopyRelationship(OpenXmlPart sourcePart, OpenXmlPart destPart, string relationshipId)
-    {
-        var hyperlink = sourcePart.HyperlinkRelationships.FirstOrDefault(item => item.Id == relationshipId);
-        if (hyperlink is not null)
-        {
-            return destPart.AddHyperlinkRelationship(hyperlink.Uri, hyperlink.IsExternal).Id;
-        }
-
-        var external = sourcePart.ExternalRelationships.FirstOrDefault(item => item.Id == relationshipId);
-        if (external is not null)
-        {
-            return destPart.AddExternalRelationship(external.RelationshipType, external.Uri).Id;
-        }
-
-        var relatedPart = sourcePart.Parts
-            .Where(item => item.RelationshipId == relationshipId)
-            .Select(item => item.OpenXmlPart)
-            .FirstOrDefault();
-        if (relatedPart is null)
-        {
-            throw new InvalidOperationException($"无法解析跨文档关系：{relationshipId}");
-        }
-
-        try
-        {
-            var copied = destPart.AddPart(relatedPart);
-            return destPart.GetIdOfPart(copied);
-        }
-        catch (Exception exception)
-        {
-            throw new InvalidOperationException($"无法迁移跨文档关系：{relationshipId}", exception);
-        }
-    }
-
-    static IEnumerable<OpenXmlElement> SelfAndDescendants(OpenXmlElement element)
-    {
-        yield return element;
-        foreach (var descendant in element.Descendants()) yield return descendant;
-    }
-
     static bool TryReadRequest(string workspace, string jobId, out ExtractChaptersRequest request, out string error)
     {
         request = new ExtractChaptersRequest();
@@ -720,14 +514,6 @@ static class ExtractChaptersAction
             error = $"无法读取 request.json：{exception.Message}";
             return false;
         }
-    }
-
-    sealed class CrossDocumentImportContext(Dictionary<string, string?> styleIds)
-    {
-        public Dictionary<string, string?> StyleIds { get; } = styleIds;
-        public Dictionary<int, int> NumberingIds { get; } = [];
-        public Dictionary<int, int> PictureBulletIds { get; } = [];
-        public Dictionary<string, string> RelationshipIds { get; } = new(StringComparer.Ordinal);
     }
 
     sealed record ChapterMatch(ExtractChapterSpec Chapter, BlockInfo? Hit, List<BlockInfo>? Range, string? Error);

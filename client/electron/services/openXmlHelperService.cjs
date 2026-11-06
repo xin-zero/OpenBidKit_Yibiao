@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const mime = require('mime-types');
 const { compactLogError, createDeveloperLogger } = require('../utils/developerLog.cjs');
+const { removeTemporaryDir } = require('../utils/forceRemove.cjs');
 const {
   getOpenXmlHelperDebugExecutablePath,
   getOpenXmlHelperProjectPath,
@@ -21,6 +22,11 @@ const TEMPLATE_PREVIEW_FILE = 'preview.docx';
 const TEMPLATE_PREVIEW_TIMEOUT_MS = 120000;
 const TEMPLATE_PREVIEW_ASSET_ROOT = 'preview-assets';
 const TEMPLATE_PREVIEW_CACHE_SIZE = 5;
+const OPENXML_ENVIRONMENT_ERROR_CODE = 'OPENXML_ENVIRONMENT';
+const BLIND_CHECK_TIMEOUT_MS = 10 * 60 * 1000;
+// 修复要改写、校验并复查副本，比单纯检查多一倍以上耗时。
+const BLIND_CHECK_FIX_TIMEOUT_MS = 15 * 60 * 1000;
+const BLIND_CHECK_PROGRESS_INTERVAL_MS = 300;
 
 /** 生成任务编号：时间戳加短随机串。 */
 function createJobId() {
@@ -323,7 +329,10 @@ function createHelperRunner({ app, writeLog, ensureExecutable, name }) {
       }
 
       if (!result?.ok) {
-        throw new Error(String(result?.error || 'Open XML 助手执行失败'));
+        const error = new Error(String(result?.error || 'Open XML 助手执行失败'));
+        // 文件被占用、无权限等环境问题无法靠调整参数解决，由调用方决定是否直接终止。
+        if (result?.errorKind === 'environment') error.code = OPENXML_ENVIRONMENT_ERROR_CODE;
+        throw error;
       }
 
       return { ...result, jobDir };
@@ -348,6 +357,8 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
   let previewAssetPromise = null;
   let previewActive = null;
   let previewPending = null;
+  // 正在使用任务目录的调用数，存储清理据此跳过运行中的助手任务。
+  let activeJobCount = 0;
   // 模板预览会在几份配置之间来回切换，留一小段最近结果就能把重复生成挡在链路之外。
   const previewCache = new Map();
   const logger = createDeveloperLogger({
@@ -359,6 +370,15 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
 
   function writeLog(event, payload = {}) {
     logger.write(event, payload);
+  }
+
+  /** 删除 root 下的任务目录或中转目录；结果已读入内存，删不掉只记日志，残留交给存储空间清理。 */
+  function removeHelperDir(target, root) {
+    const resolved = path.resolve(target);
+    if (path.dirname(resolved) !== path.resolve(root)) return Promise.resolve();
+    return removeTemporaryDir(resolved, (error) => {
+      writeLog('openxml.job.cleanup_failed', { target: path.basename(resolved), error: compactLogError(error) });
+    });
   }
 
   /** 开发态异步编译助手，避免首次预览同步阻塞 Main 进程。 */
@@ -397,9 +417,21 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
 
   const runner = createHelperRunner({ app, writeLog, ensureExecutable, name: 'main' });
   const previewRunner = createHelperRunner({ app, writeLog, ensureExecutable, name: 'preview' });
+  // 暗标检查大文档会占用较多内存且可能被取消，用独立进程，不影响导出和预览队列。
+  const blindCheckRunner = createHelperRunner({ app, writeLog, ensureExecutable, name: 'blind-check' });
 
   function ping() {
     return runner.runJob({ action: 'ping', timeoutMs: PING_TIMEOUT_MS });
+  }
+
+  /** Agent 工具直接提交的任务，调用方读完任务目录前都计为运行中。 */
+  async function runTrackedJob(request) {
+    activeJobCount += 1;
+    try {
+      return await runner.runJob(request);
+    } finally {
+      activeJobCount -= 1;
+    }
   }
 
   /**
@@ -543,6 +575,7 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
     let temporaryAssets;
     let result;
     const assetTypes = {};
+    activeJobCount += 1;
     try {
       if (options.copyAssets) {
         const workspace = getWorkspaceDir(app);
@@ -589,6 +622,10 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
             margin_bottom_cm: chrome.layout.marginBottomCm,
             text_layout: chrome.textLayout,
           },
+          // 整本导出并入的已填商务模版（工作区相对路径）及各章节块号。
+          ...(options.businessTemplate ? { business_template: options.businessTemplate } : {}),
+          // 有目录时另存只含目录页的小文档，供复测目录页数。
+          ...(options.tocMeasure ? { toc_measure: true } : {}),
         },
         // 整本转换使用正式任务队列，避免占用样张预览队列及其两分钟时限。
         timeoutMs: options.wholeDocument ? 30 * 60 * 1000 : TEMPLATE_PREVIEW_TIMEOUT_MS,
@@ -598,17 +635,130 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
         bytes: new Uint8Array(fs.readFileSync(path.join(result.jobDir, TEMPLATE_PREVIEW_FILE))),
         roles: Array.isArray(result.paragraphRoles) ? result.paragraphRoles : [],
         imageWarnings: result.imageWarnings,
+        businessFieldIds: result.businessFieldIds || [],
+        businessWarnings: result.businessWarnings || [],
+        pendingMarkCount: result.pendingMarkCount || 0,
+        toc: result.toc || null,
+        tocOnlyBytes: result.toc?.tocOnly ? new Uint8Array(fs.readFileSync(path.join(result.jobDir, result.toc.tocOnly))) : null,
+        pageRefs: result.pageRefs || null,
       };
     } finally {
-      const jobsRoot = path.resolve(getOpenXmlJobsDir(app));
-      if (result) {
-        const jobDir = path.resolve(result.jobDir);
-        if (path.dirname(jobDir) === jobsRoot) fs.rmSync(jobDir, { recursive: true, force: true });
-      }
-      if (temporaryAssets && path.dirname(temporaryAssets) === path.resolve(getWorkspaceDir(app))) {
-        fs.rmSync(temporaryAssets, { recursive: true, force: true });
-      }
+      // 清理不抛错；计数在清理后归还，存储清理不会与之并发。
+      if (result) await removeHelperDir(result.jobDir, getOpenXmlJobsDir(app));
+      if (temporaryAssets) await removeHelperDir(temporaryAssets, getWorkspaceDir(app));
+      activeJobCount -= 1;
     }
+  }
+
+  /**
+   * 把测量得到的页码写入整本导出目录和页码引用的域缓存值；完整文档和只含目录的小文档共用。
+   * pageNumbers / pageRefs 为 null 时不回填对应部分，返回新文档和未写入页码的目录条数、页码引用数。
+   */
+  async function fillTocPageNumbers(bytes, pageNumbers, pageRefs = null) {
+    let result;
+    activeJobCount += 1;
+    try {
+      result = await runner.runJob({
+        action: 'fill-toc-page-numbers',
+        request: {
+          input: 'input.docx',
+          output: 'output.docx',
+          ...(pageNumbers ? { page_numbers: pageNumbers } : {}),
+          ...(pageRefs ? { page_refs: pageRefs } : {}),
+        },
+        prepare: (jobDir) => fs.writeFileSync(path.join(jobDir, 'input.docx'), bytes),
+        timeoutMs: 10 * 60 * 1000,
+      });
+      return {
+        bytes: new Uint8Array(fs.readFileSync(path.join(result.jobDir, 'output.docx'))),
+        missingCount: result.toc?.missingCount || 0,
+        refMissingCount: result.pageRefs?.missingCount || 0,
+      };
+    } finally {
+      if (result) await removeHelperDir(result.jobDir, getOpenXmlJobsDir(app));
+      activeJobCount -= 1;
+    }
+  }
+
+  /** 按块号从商务模版截出单章 Word 供正文页只读预览；走预览进程，不排在整本导出和回填之后。 */
+  async function createTemplateChapterDocx({ input, startBlock, endBlock }) {
+    let result;
+    activeJobCount += 1;
+    try {
+      result = await previewRunner.runJob({
+        action: 'slice-template-chapter',
+        request: { input, start_block: startBlock, end_block: endBlock },
+        timeoutMs: TEMPLATE_PREVIEW_TIMEOUT_MS,
+      });
+      return new Uint8Array(fs.readFileSync(path.join(result.jobDir, 'chapter.docx')));
+    } finally {
+      if (result) await removeHelperDir(result.jobDir, getOpenXmlJobsDir(app));
+      activeJobCount -= 1;
+    }
+  }
+
+  /**
+   * 暗标合规检查与修复共用的执行方式。助手把进度写在任务目录的 progress.json，这里轮询后回调；
+   * 每次结束都结束该进程，避免空闲进程继续占着处理大文档时的内存。
+   */
+  async function runBlindCheckJob({ action, request, outputName, timeoutMs }, { signal, onProgress } = {}) {
+    let jobDir = '';
+    let timer = null;
+    let lastProgress = '';
+    const pollProgress = () => {
+      try {
+        const raw = fs.readFileSync(path.join(jobDir, 'progress.json'), 'utf8');
+        if (raw === lastProgress) return;
+        lastProgress = raw;
+        const progress = JSON.parse(raw);
+        onProgress?.({ frac: Number(progress.frac) || 0, label: String(progress.label || '') });
+      } catch {
+        // 助手替换进度文件的瞬间可能读不到，下一轮再读。
+      }
+    };
+    activeJobCount += 1;
+    try {
+      const result = await blindCheckRunner.runJob({
+        action,
+        request,
+        prepare: (dir) => {
+          jobDir = dir;
+          timer = setInterval(pollProgress, BLIND_CHECK_PROGRESS_INTERVAL_MS);
+        },
+        timeoutMs,
+        signal,
+      });
+      return JSON.parse(fs.readFileSync(path.join(result.jobDir, String(result.output || outputName)), 'utf8'));
+    } finally {
+      if (timer) clearInterval(timer);
+      await blindCheckRunner.close().catch(() => undefined);
+      if (jobDir) await removeHelperDir(jobDir, getOpenXmlJobsDir(app));
+      activeJobCount -= 1;
+    }
+  }
+
+  function runBlindCheck(request, options) {
+    return runBlindCheckJob({ action: 'blind-check-inspect', request, outputName: 'blind-check-result.json', timeoutMs: BLIND_CHECK_TIMEOUT_MS }, options);
+  }
+
+  /** 暗标自动修复：在工作区写出修复副本并复查，原文件不改动。 */
+  function runBlindCheckFix(request, options) {
+    return runBlindCheckJob({ action: 'blind-check-fix', request, outputName: 'blind-check-fix-result.json', timeoutMs: BLIND_CHECK_FIX_TIMEOUT_MS }, options);
+  }
+
+  /** 暗标 AI 复核：按段落编号导出标书结构（正文、页眉页脚、分节页码、图片清单）。 */
+  function runBlindCheckDump(request, options) {
+    return runBlindCheckJob({ action: 'blind-check-dump', request, outputName: 'blind-check-dump.json', timeoutMs: BLIND_CHECK_TIMEOUT_MS }, options);
+  }
+
+  /** 暗标 AI 复核：在修复副本上执行 Agent 提交的文字级修改，校验后覆盖副本并返回新的标书结构。 */
+  function runBlindCheckEdit(request, options) {
+    return runBlindCheckJob({ action: 'blind-check-edit', request, outputName: 'blind-check-edit-result.json', timeoutMs: BLIND_CHECK_FIX_TIMEOUT_MS }, options);
+  }
+
+  /** 结束暗标检查助手进程；应用退出时调用。 */
+  function closeBlindCheck() {
+    return blindCheckRunner.close();
   }
 
   /** 结束助手进程并拒绝未完成任务。 */
@@ -629,13 +779,22 @@ function createOpenXmlHelperService({ app, configStore } = {}) {
 
   return {
     ping,
-    runJob: runner.runJob,
+    runJob: runTrackedJob,
+    hasActiveJobs: () => activeJobCount > 0,
     renderRestrictedHtmlDocx,
     createRestrictedHtmlDocx,
+    fillTocPageNumbers,
+    createTemplateChapterDocx,
+    runBlindCheck,
+    runBlindCheckFix,
+    runBlindCheckDump,
+    runBlindCheckEdit,
+    closeBlindCheck,
     close,
   };
 }
 
 module.exports = {
+  OPENXML_ENVIRONMENT_ERROR_CODE,
   createOpenXmlHelperService,
 };

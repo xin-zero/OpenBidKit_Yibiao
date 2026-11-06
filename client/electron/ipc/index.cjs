@@ -7,12 +7,16 @@ const { registerCredentialLibraryIpc } = require('./credentialLibraryIpc.cjs');
 const { registerDeveloperIpc } = require('./developerIpc.cjs');
 const { registerDonationIpc } = require('./donationIpc.cjs');
 const { registerDuplicateCheckIpc } = require('./duplicateCheckIpc.cjs');
+const { registerBlindCheckIpc } = require('./blindCheckIpc.cjs');
 const { registerExportIpc } = require('./exportIpc.cjs');
 const { registerFileIpc } = require('./fileIpc.cjs');
 const { registerKnowledgeBaseIpc } = require('./knowledgeBaseIpc.cjs');
 const { registerLicenseIpc } = require('./licenseIpc.cjs');
+const { registerNoticeIpc } = require('./noticeIpc.cjs');
+const { createNoticeMediaCacheService } = require('../services/noticeMediaCacheService.cjs');
 const { registerOfficialAccountIpc, registerOfficialInvoiceIpc } = require('./officialAccountIpc.cjs');
 const { registerRejectionCheckIpc } = require('./rejectionCheckIpc.cjs');
+const { registerStorageIpc } = require('./storageIpc.cjs');
 const { registerTaskIpc } = require('./taskIpc.cjs');
 const { registerTechnicalPlanIpc } = require('./technicalPlanIpc.cjs');
 const { registerFeasibilityReportIpc } = require('./feasibilityReportIpc.cjs');
@@ -31,6 +35,7 @@ const { createDeveloperLayoutFigureService } = require('../services/developerLay
 const { createDonationService } = require('../services/donationService.cjs');
 const { createDuplicateCheckService } = require('../services/duplicateCheckService.cjs');
 const { createDuplicateCheckStore } = require('../services/duplicateCheckStore.cjs');
+const { createBlindCheckStore } = require('../services/blindCheckStore.cjs');
 const { createCheckResultExportService } = require('../services/checkResultExportService.cjs');
 const { createExportService } = require('../services/exportService.cjs');
 const { createFileService } = require('../services/fileService.cjs');
@@ -42,6 +47,7 @@ const { createRejectionCheckStore } = require('../services/rejectionCheckStore.c
 const { createSqliteDatabase } = require('../services/sqliteDatabase.cjs');
 const { createSystemFontService } = require('../services/systemFontService.cjs');
 const { clearOrphanedGeneratedImages, clearStalePiTaskArchives, runHistoricalStorageCleanup } = require('../services/storageCleanupService.cjs');
+const { createStorageSpaceService } = require('../services/storageSpaceService.cjs');
 const { createTaskService } = require('../services/taskService.cjs');
 const { createAgentWorkspaceService } = require('../services/agentWorkspaceService.cjs');
 const { createTaskLogStore } = require('../services/taskLogStore.cjs');
@@ -149,6 +155,7 @@ const workspaceDatabaseChannels = [
   'technical-plan:read-tender-markdown',
   'technical-plan:read-content-word',
   'technical-plan:preview-content-word',
+  'technical-plan:preview-business-chapter-word',
   'technical-plan:read-tender-source-markdown',
   'technical-plan:update-step',
   'technical-plan:save-bid-analysis-config',
@@ -156,10 +163,12 @@ const workspaceDatabaseChannels = [
   'technical-plan:save-outline',
   'technical-plan:save-global-facts',
   'technical-plan:save-content-generation-options',
-  'technical-plan:save-chapter-content',
   'technical-plan:reset-content-generation',
   'technical-plan:clear',
+  'technical-plan:inspect-bid-template',
   'technical-plan:open-bid-template',
+  'technical-plan:get-business-fill-review',
+  'technical-plan:save-business-fill-review',
   'feasibility-report:load-state',
   'feasibility-report:import-source-documents',
   'feasibility-report:remove-source-document',
@@ -187,6 +196,22 @@ const workspaceDatabaseChannels = [
   'rejection-check:update-state',
   'rejection-check:export-excel',
   'rejection-check:clear',
+  'blind-check:load-state',
+  'blind-check:import-file',
+  'blind-check:remove-file',
+  'blind-check:save-ui-state',
+  'blind-check:list-presets',
+  'blind-check:create-preset',
+  'blind-check:update-preset',
+  'blind-check:delete-preset',
+  'blind-check:select-preset',
+  'blind-check:set-use-credential-words',
+  'blind-check:get-credential-words',
+  'blind-check:get-input-signature',
+  'blind-check:save-fix-rules',
+  'blind-check:save-fixed-document',
+  'blind-check:get-tender-sources',
+  'blind-check:clear',
   'knowledge-base:list',
   'knowledge-base:search',
   'knowledge-base:create-folder',
@@ -203,12 +228,19 @@ const workspaceDatabaseChannels = [
   'tasks:start-outline-generation',
   'tasks:confirm-outline-selection',
   'tasks:suppress-outline-selection-auto-confirmation',
+  'tasks:confirm-business-fill-review',
+  'tasks:suppress-business-fill-review-auto-confirmation',
+  'tasks:start-bid-template-extraction',
+  'tasks:start-rule-page-compile',
   'tasks:start-global-facts-generation',
   'tasks:start-content-generation',
   'tasks:pause-content-generation',
   'tasks:start-rejection-items-extraction',
   'tasks:start-rejection-check',
   'tasks:start-duplicate-analysis',
+  'tasks:start-blind-check',
+  'tasks:start-blind-check-fix',
+  'tasks:start-blind-check-preset-extraction',
   'tasks:start-feasibility-analysis',
   'tasks:start-feasibility-outline',
   'tasks:start-feasibility-parameters',
@@ -223,6 +255,8 @@ const workspaceDatabaseChannels = [
   'templates:delete',
   'templates:duplicate',
   'templates:render-preview',
+  'storage:get-usage',
+  'storage:clean',
 ];
 
 function clearWorkspaceDatabaseIpc() {
@@ -281,7 +315,7 @@ function registerWorkspaceDatabaseStatusIpc({ mainWindow }) {
   };
 }
 
-function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentService, autoConfirmationService, fileService, openXmlHelperService, updateStatus }) {
+function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentService, autoConfirmationService, fileService, openXmlHelperService, isUpdateCacheInUse, updateStatus }) {
   const sqliteDatabase = createSqliteDatabase(app, { onStatus: updateStatus });
   runHistoricalStorageCleanup({ app, db: sqliteDatabase.db, configStore, onStatus: updateStatus });
   clearStalePiTaskArchives(app);
@@ -296,6 +330,7 @@ function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentS
   const feasibilityReportStore = createFeasibilityReportStore({ app, db: sqliteDatabase.db, fileService, taskLogStore, agentService });
   const duplicateCheckStore = createDuplicateCheckStore({ app, db: sqliteDatabase.db, taskLogStore });
   const rejectionCheckStore = createRejectionCheckStore({ app, db: sqliteDatabase.db, fileService, technicalPlanStore, taskLogStore });
+  const blindCheckStore = createBlindCheckStore({ app, db: sqliteDatabase.db, taskLogStore, credentialLibraryService, fileService, technicalPlanStore });
   const templateStore = createTemplateStore({ db: sqliteDatabase.db });
   // 系统预设模板的真源在代码里，每次启动对齐一次，保证首启和版本升级都能拿到最新预设。
   templateStore.syncSystemTemplates();
@@ -305,8 +340,9 @@ function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentS
     dialog,
     rejectionCheckStore,
     duplicateCheckStore,
+    blindCheckStore,
   });
-  const taskService = createTaskService({ templateStore, aiService, agentService, autoConfirmationService, technicalPlanStore, rejectionCheckStore, duplicateCheckStore, feasibilityReportStore, knowledgeBaseService, duplicateCheckService, openXmlHelperService });
+  const taskService = createTaskService({ templateStore, aiService, agentService, autoConfirmationService, technicalPlanStore, rejectionCheckStore, duplicateCheckStore, blindCheckStore, feasibilityReportStore, knowledgeBaseService, duplicateCheckService, openXmlHelperService, credentialLibraryService });
   const agentWorkspaceService = createAgentWorkspaceService({ agentService, taskService, technicalPlanStore, feasibilityReportStore });
   agentWorkspaceServiceRef = agentWorkspaceService;
   technicalPlanStore.setAgentWorkspaceChangeListener(() => agentWorkspaceService.emitWorkspacesChanged());
@@ -322,9 +358,13 @@ function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentS
   registerFeasibilityReportIpc({ feasibilityReportStore, taskService });
   registerDuplicateCheckIpc({ duplicateCheckStore, checkResultExportService });
   registerRejectionCheckIpc({ rejectionCheckStore, taskService, checkResultExportService });
+  registerBlindCheckIpc({ blindCheckStore, taskService, checkResultExportService });
   registerTemplateIpc({ templateStore, openXmlHelperService });
   registerOfficialInvoiceIpc({ officialInvoiceStore: createOfficialInvoiceStore({ db: sqliteDatabase.db }) });
   registerTaskIpc({ taskService });
+  registerStorageIpc({
+    storageSpaceService: createStorageSpaceService({ app, db: sqliteDatabase.db, taskService, agentService, openXmlHelperService, isUpdateCacheInUse }),
+  });
   updateStatus({ phase: 'ready', ready: true, message: '本地数据库已就绪' });
   
   // 更新 pluginService 的服务引用
@@ -342,14 +382,18 @@ function registerWorkspaceDatabaseServices({ app, configStore, aiService, agentS
     console.error('[plugin-service] 启用插件失败:', error);
   });
   
-  return { sqliteDatabase, technicalPlanExport: createTechnicalPlanExport({ technicalPlanStore, templateStore, agentService, openXmlHelperService }) };
+  return { sqliteDatabase, technicalPlanExport: createTechnicalPlanExport({ technicalPlanStore, templateStore, agentService, openXmlHelperService, credentialLibraryService,
+    startContentGeneration: payload => taskService.startContentGeneration(payload),
+  }) };
 }
 
-function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerUpdateDownload, quitAndInstall, getLatestVersion, getUpdateDownloadUrl, gpuStartupState = {}, gpuTrialArg = '--yibiao-trial-hardware-acceleration', forceDisableGpuArgs = [], openDeveloperTokenStatsWindow, closeDeveloperTokenStatsWindow, openDeveloperAgentMonitorWindow, closeDeveloperAgentMonitorWindow }) {
+// 装配应用服务与 IPC；公告缓存独立于工作区数据库生命周期。
+function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerUpdateDownload, isUpdateCacheInUse, quitAndInstall, getLatestVersion, getUpdateDownloadUrl, gpuStartupState = {}, gpuTrialArg = '--yibiao-trial-hardware-acceleration', forceDisableGpuArgs = [], openDeveloperTokenStatsWindow, closeDeveloperTokenStatsWindow, openDeveloperAgentMonitorWindow, closeDeveloperAgentMonitorWindow }) {
   void checkRequiredOnlineServices();
   const configStore = createConfigStore(app);
   initLocalImageRenderService({ configStore });
   const licenseService = createLicenseService({ app, configStore });
+  const noticeMediaCacheService = createNoticeMediaCacheService({ app });
   const officialAccountService = createOfficialAccountService({ app, configStore, powerMonitor });
   const aiService = createAiService({ app, configStore });
   const developerExpansionReplaceTestService = createDeveloperExpansionReplaceTestService({ aiService });
@@ -370,12 +414,15 @@ function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerU
   let workspaceDatabaseStarted = false;
   let gpuTrialRelaunchStarted = false;
 
+  // 关闭所有后台服务，并等待公告下载的临时文件清理完成。
   const closeServices = async () => {
+    await noticeMediaCacheService.close();
     await officialAccountService.close();
     donationService.close?.();
     await agentService.close?.();
     autoConfirmationService.close?.();
     await openXmlHelperService.close?.();
+    await openXmlHelperService.closeBlindCheck?.();
   };
 
   const closeServicesBeforeExit = async () => {
@@ -459,6 +506,7 @@ function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerU
   });
   registerDonationIpc({ donationService });
   registerLicenseIpc({ licenseService });
+  registerNoticeIpc({ noticeMediaCacheService });
   registerOfficialAccountIpc({ officialAccountService });
   void officialAccountService.start().catch(() => undefined);
   registerAiIpc({ aiService });
@@ -492,7 +540,7 @@ function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerU
     databaseStatus.updateStatus({ phase: 'checking', ready: false, message: '正在检查本地数据库' });
     setTimeout(() => {
       try {
-        ({ technicalPlanExport } = registerWorkspaceDatabaseServices({ app, configStore, aiService, agentService, autoConfirmationService, fileService, openXmlHelperService, updateStatus: databaseStatus.updateStatus }));
+        ({ technicalPlanExport } = registerWorkspaceDatabaseServices({ app, configStore, aiService, agentService, autoConfirmationService, fileService, openXmlHelperService, isUpdateCacheInUse, updateStatus: databaseStatus.updateStatus }));
         setTimeout(() => {
           void agentService.warmup?.().catch((error) => {
             console.warn('[agent] warmup failed', error?.message || String(error));

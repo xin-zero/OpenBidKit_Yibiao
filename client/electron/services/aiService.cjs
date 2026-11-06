@@ -1,15 +1,19 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { Agent, fetch: undiciFetch } = require('undici');
 const { nativeImage } = require('electron');
 const { getGeneratedImagesDir } = require('../utils/paths.cjs');
+const { compressGeneratedImage } = require('../utils/imageCompression.cjs');
 const { createDeveloperLogger } = require('../utils/developerLog.cjs');
 const { createAiRequestQueue } = require('../utils/aiRequestQueue.cjs');
 const { bindAiRequestActivity, notifyAiResponse, withAiResponseActivity } = require('../utils/aiRequestActivity.cjs');
+const { fetchWithRedirect } = require('../utils/fetchWithRedirect.cjs');
 const {
   copyAiHttpError,
   createAiHttpErrorFromResponse,
   emitAiHttpErrorToWindows,
+  isAiHttpErrorHtmlPayload,
 } = require('../utils/aiHttpError.cjs');
 const {
   copyAiRequestErrorMeta,
@@ -23,19 +27,17 @@ const {
   resolveAiLogTitle,
   writeAiLog,
 } = require('../utils/aiLog.cjs');
+const { createAiRawLog } = require('../utils/aiRawLog.cjs');
 const textTokenStatsStore = require('./textTokenStatsStore.cjs');
 const { buildImageStylePrompt } = require('./aiImageStyles.cjs');
 const { normalizeTokenUsage } = textTokenStatsStore;
 
 const AI_REQUEST_TIMEOUT_MS = 600000;
+const IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS = 60000;
+const IMAGE_DOWNLOAD_FAMILIES = [4, 6];
 const MULTIMODAL_IMAGE_MAX_EDGE = 2048;
 const MULTIMODAL_IMAGE_JPEG_QUALITY = 85;
 
-// 金龙中转站废弃模型映射：使用这些模型时自动切换到替代模型
-const JINLONG_DEPRECATED_MODEL_MAP = {
-  'codex-auto-review': 'gpt-5.6-terra',
-  'gpt-5.6-luna': 'gpt-5.6-terra',
-};
 const IMAGE_MODEL_TEST_TIMEOUT_MESSAGE = '生图模型测试超时，请检查 Base URL、API Key 或模型名称';
 const ANALYTICS_ENDPOINT = 'https://analytics.agnet.top/track';
 const ANALYTICS_PROJECT_NAME = 'yibiao-client';
@@ -472,31 +474,91 @@ function createAiResponseDataError(message, responseData) {
   return error;
 }
 
-async function downloadImage(url, options = {}) {
-  let response = null;
-  try {
-    response = await fetch(url, { signal: options.signal });
-  } catch (error) {
-    throw markAiRequestError(error, { retryable: true });
-  }
-  await ensureOk(response, '图片下载失败');
-  return {
-    buffer: Buffer.from(await response.arrayBuffer()),
-    mime_type: response.headers.get('content-type') || 'image/png',
-  };
+function createImageDownloadDispatcher(family) {
+  return new Agent({
+    connect: {
+      family,
+      autoSelectFamily: false,
+      timeout: IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS,
+    },
+    headersTimeout: IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS,
+    bodyTimeout: IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS,
+  });
 }
 
+const imageDownloadDispatchers = new Map(IMAGE_DOWNLOAD_FAMILIES.map((family) => [
+  family,
+  createImageDownloadDispatcher(family),
+]));
+
+// 图片地址先用 IPv4 下载，失败后再用 IPv6。每轮最多 60 秒，两轮都失败则结束，总等待不超过 2 分钟。
+async function downloadImageOnce(url, family, options) {
+  const attemptSignal = AbortSignal.timeout(IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS);
+  const signal = options.signal ? AbortSignal.any([attemptSignal, options.signal]) : attemptSignal;
+  try {
+    const response = await undiciFetch(url, {
+      signal,
+      dispatcher: imageDownloadDispatchers.get(family),
+    });
+    await ensureOk(response, `IPv${family} 图片下载失败`);
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      mime_type: response.headers.get('content-type') || 'image/png',
+    };
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw error;
+    }
+    if (attemptSignal.aborted) {
+      throw new Error(`IPv${family} 图片下载超时`);
+    }
+    const detail = error?.cause?.code || error?.message || '图片下载失败';
+    const message = String(detail).startsWith(`IPv${family}`) ? String(detail) : `IPv${family}：${detail}`;
+    throw copyRawAiErrorResponse(error, new Error(message));
+  }
+}
+
+function selectImageDownloadHttpError(errors) {
+  return errors.find((error) => isAiHttpErrorHtmlPayload(error?.aiHttpError))
+    || errors.find((error) => error?.aiHttpError || Object.prototype.hasOwnProperty.call(error, 'raw_response_body'))
+    || null;
+}
+
+async function downloadImage(url, options = {}) {
+  const failures = [];
+  for (const family of IMAGE_DOWNLOAD_FAMILIES) {
+    if (options.signal?.aborted) {
+      throw markAiRequestError(options.signal.reason instanceof Error ? options.signal.reason : new Error('AI 请求已取消'), { retryable: false });
+    }
+    try {
+      return await downloadImageOnce(url, family, options);
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw markAiRequestError(error, { retryable: false });
+      }
+      failures.push(error);
+    }
+  }
+  const error = new Error(`图片下载失败：${failures.map((item) => item?.message || '图片下载失败').join('；')}`);
+  const httpError = selectImageDownloadHttpError(failures);
+  if (httpError) {
+    copyRawAiErrorResponse(httpError, error);
+  }
+  throw markAiRequestError(error, { retryable: false });
+}
+
+// 生图结果落盘前压缩，后续正文、预览和 Word 均使用压缩后的文件。
 function saveGeneratedImage(app, image) {
   const imagesDir = getGeneratedImagesDir(app);
   fs.mkdirSync(imagesDir, { recursive: true });
-  const extension = imageExtensionFromMime(image.mime_type);
-  const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomUUID()}.${extension}`;
+  const compressed = compressGeneratedImage(image.buffer, imageExtensionFromMime(image.mime_type));
+  const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomUUID()}.${compressed.extension}`;
   const filePath = path.join(imagesDir, fileName);
-  fs.writeFileSync(filePath, image.buffer);
+  fs.writeFileSync(filePath, compressed.buffer);
   return {
     asset_url: `yibiao-asset://generated-images/${encodeURIComponent(fileName)}`,
     file_path: filePath,
-    mime_type: image.mime_type,
+    mime_type: compressed.extension === 'jpg' ? 'image/jpeg' : image.mime_type,
   };
 }
 
@@ -511,7 +573,7 @@ async function ensureOk(response, fallbackMessage, options = {}) {
 async function fetchOpenAICompatibleImageResponse(baseUrl, apiKey, requestBody, fallbackMessage, options = {}) {
   const sendRequest = async (body) => {
     try {
-      return await fetch(`${baseUrl}/images/generations`, {
+      return await fetchWithRedirect(`${baseUrl}/images/generations`, {
         method: 'POST',
         headers: createHeaders(apiKey),
         body: JSON.stringify(body),
@@ -896,15 +958,13 @@ async function collectJsonResponseWithConfig(app, config, request) {
   throw new Error(lastError?.message || failureMessage);
 }
 
-// 按文本模型设置统一输出上限，覆盖 Agent SDK 自带的长度参数；缓存预热等请求可单独指定上限。
+// 所有服务商统一使用 max_completion_tokens 设置输出上限，覆盖 Agent SDK 长度参数；请求可单独指定上限。
 function applyOutputTokenLimit(body, config, requestLimit = 0) {
   delete body.max_output_tokens;
   delete body.max_tokens;
   const limit = requestLimit > 0 ? requestLimit : config.output_token_limit;
   if (limit > 0) {
     body.max_completion_tokens = limit;
-    // 官方只接受新字段；其他服务商保留原有的双字段请求方式。
-    if (config.text_model_provider !== 'official') body.max_tokens = limit;
   } else {
     delete body.max_completion_tokens;
   }
@@ -913,11 +973,8 @@ function applyOutputTokenLimit(body, config, requestLimit = 0) {
 
 // 构造普通、流式及 JSON 文本请求。
 function createChatRequestBody(config, request, options = {}) {
-  const modelName = config.text_model_provider === 'jinlong'
-    ? (JINLONG_DEPRECATED_MODEL_MAP[config.model_name] || config.model_name)
-    : config.model_name;
   const body = {
-    model: modelName,
+    model: config.model_name,
     messages: request.messages,
   };
 
@@ -969,17 +1026,23 @@ function createAgentChatRequestBody(config, sourceBody) {
   return applyOutputTokenLimit(body, config);
 }
 
+// 统一发送文本请求，并在解析前旁路记录上游原始响应。
 async function fetchChatCompletion(app, config, body, options = {}) {
   const controller = options.signal ? null : new AbortController();
   const timer = controller ? setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS) : null;
   const baseUrl = requireBaseUrl(config.base_url, '请先在设置中配置文本模型 Base URL');
   try {
-    return await fetch(`${baseUrl}/chat/completions`, {
+    const url = `${baseUrl}/chat/completions`;
+    const headers = createHeaders(config.api_key, config.text_model_provider);
+    const serializedBody = JSON.stringify(body);
+    options.rawAttempt?.request(url, headers, serializedBody);
+    const response = await fetchWithRedirect(url, {
       method: 'POST',
-      headers: createHeaders(config.api_key, config.text_model_provider),
-      body: JSON.stringify(body),
+      headers,
+      body: serializedBody,
       signal: options.signal || controller.signal,
     });
+    return options.rawAttempt ? options.rawAttempt.captureResponse(response) : response;
   } catch (error) {
     throw markAiRequestError(error, { retryable: true });
   } finally {
@@ -989,13 +1052,15 @@ async function fetchChatCompletion(app, config, body, options = {}) {
   }
 }
 
-async function ensureTextAiResponseOk(response, fallbackMessage) {
+async function ensureTextAiResponseOk(response, fallbackMessage, config) {
   if (response.ok) {
     return;
   }
 
   throw await createAiHttpErrorFromResponse(response, fallbackMessage, {
     source: 'text-model',
+    // 与官方请求头使用同一判断，余额不足只认发往易标官方服务商的请求。
+    official: config.text_model_provider === 'official',
     responseFormatUnsupportedChecker: isResponseFormatUnsupported,
   });
 }
@@ -1141,9 +1206,10 @@ async function readOpenAIChatStream(response) {
   };
 }
 
+// 消费普通文本响应，原始日志由统一接口入口采集。
 async function requestTextAiNormal(app, config, requestBody, options = {}) {
-  const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal });
-  await ensureTextAiResponseOk(response, 'AI 请求失败');
+  const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal, rawAttempt: options.rawAttempt });
+  await ensureTextAiResponseOk(response, 'AI 请求失败', config);
   let responseData = null;
   try {
     responseData = await response.json();
@@ -1158,19 +1224,28 @@ async function requestTextAiNormal(app, config, requestBody, options = {}) {
   };
 }
 
+// 消费流式文本响应，原始日志由统一接口入口采集。
 async function requestTextAiStream(app, config, requestBody, options = {}) {
-  const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal });
-  await ensureTextAiResponseOk(response, 'AI 请求失败');
+  const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal, rawAttempt: options.rawAttempt });
+  await ensureTextAiResponseOk(response, 'AI 请求失败', config);
   return readOpenAIChatStream(response);
 }
 
+// 每次实际请求独立记录结果，自动重试仍归入同一原始日志文件。
 async function requestTextAi(app, config, requestBody, options = {}) {
   return withAiResponseActivity(async () => {
-    if (options.requestMode === 'stream') {
-      return requestTextAiStream(app, config, requestBody, options);
+    const rawAttempt = options.rawLog?.beginAttempt();
+    try {
+      const result = options.requestMode === 'stream'
+        ? await requestTextAiStream(app, config, requestBody, { ...options, rawAttempt })
+        : await requestTextAiNormal(app, config, requestBody, { ...options, rawAttempt });
+      rawAttempt?.finish('success', null, options.signal);
+      return result;
+    } catch (error) {
+      rawAttempt?.finish(options.signal?.aborted && (error === options.signal.reason || error.name === 'AbortError')
+        ? 'cancelled' : 'failed', error, options.signal);
+      throw error;
     }
-
-    return requestTextAiNormal(app, config, requestBody, options);
   });
 }
 
@@ -1368,7 +1443,7 @@ async function requestGoogleImageData(baseUrl, imageConfig, requestBody, request
   return withAiResponseActivity(async () => {
     let response = null;
     try {
-      response = await fetch(createGoogleImageUrl(baseUrl, imageConfig.model_name, requestMode), {
+      response = await fetchWithRedirect(createGoogleImageUrl(baseUrl, imageConfig.model_name, requestMode), {
         method: 'POST',
         headers: createGoogleHeaders(imageConfig.api_key),
         body: JSON.stringify(requestBody),
@@ -1403,6 +1478,7 @@ function getGoogleText(responseData) {
     .trim();
 }
 
+// 执行普通文本请求，并分别保留现有日志和完整接口日志。
 async function chatWithConfig(app, config, request) {
   if (!config.api_key) {
     throw new Error('请先在设置中配置文本模型 API Key');
@@ -1420,6 +1496,7 @@ async function chatWithConfig(app, config, request) {
   };
   const requestId = createRequestId();
   const logTitle = resolveAiLogTitle(request, '文本请求');
+  const rawLog = createAiRawLog(app, config, requestId, logTitle);
   const requestMode = normalizeTextRequestMode(config);
   let requestBody = createChatRequestBody(config, preparedRequest, { stream: requestMode === 'stream' });
   let responseData = null;
@@ -1441,14 +1518,14 @@ async function chatWithConfig(app, config, request) {
     let result = null;
     result = await runWithAiRetry(() => runWithOperationTimeout(async (signal) => {
       try {
-        return await requestTextAi(app, config, requestBody, { signal, requestMode });
+        return await requestTextAi(app, config, requestBody, { signal, requestMode, rawLog });
       } catch (error) {
         if (!preparedRequest.response_format || !error.responseFormatUnsupported) {
           throw error;
         }
 
         requestBody = createChatRequestBody(config, preparedRequest, { omitResponseFormat: true, stream: requestMode === 'stream' });
-        return requestTextAi(app, config, requestBody, { signal, requestMode });
+        return requestTextAi(app, config, requestBody, { signal, requestMode, rawLog });
       }
     }, timeoutMs, request.signal));
 
@@ -1472,8 +1549,11 @@ async function chatWithConfig(app, config, request) {
       content,
       created_at: new Date().toISOString(),
     });
+    rawLog?.finish('success');
     return content;
   } catch (error) {
+    rawLog?.finish(request.signal?.aborted && (error === request.signal.reason || error.name === 'AbortError')
+      ? 'cancelled' : 'failed', error, request.signal);
     errorMessage = error.name === 'AbortError'
       ? request.timeout_message || `AI 请求超时（${timeoutMs / 1000} 秒）`
       : error.message;
@@ -1524,6 +1604,8 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
   ensureMultimodalEnabled(config, requestBody.messages);
   const requestMode = requestBody.stream ? 'stream' : 'normal';
   const logTitle = resolveAiLogTitle(request, 'Pi Agent');
+  const rawLog = createAiRawLog(app, config, requestId, logTitle);
+  const rawAttempt = rawLog?.beginAttempt();
   let responseData = null;
   let analyticsTracked = false;
 
@@ -1538,13 +1620,14 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
       status: 'pending',
       created_at: new Date().toISOString(),
     });
-    await Promise.resolve(request.onRequestStart?.({ config, requestBody, requestId }));
-    const response = await fetchChatCompletion(app, config, requestBody, { signal: request.signal });
-    await ensureTextAiResponseOk(response, 'AI 请求失败');
+    await Promise.resolve(request.onRequestStart?.({ config, requestBody, requestId, rawAttempt }));
+    const response = await fetchChatCompletion(app, config, requestBody, { signal: request.signal, rawAttempt });
+    await ensureTextAiResponseOk(response, 'AI 请求失败', config);
     const result = await request.consumeResponse(response, {
       config,
       requestBody,
       requestId,
+      rawAttempt,
     });
     responseData = result?.responseData ?? null;
     recordTextTokenStats(config, result?.usage);
@@ -1561,8 +1644,15 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
       content: result?.content || '',
       created_at: new Date().toISOString(),
     });
+    rawAttempt?.finish('success');
+    rawLog?.finish('success');
     return result;
   } catch (error) {
+    // 上游报错引发的连接中止仍记为失败，只有实际取消异常才记为取消。
+    const status = request.signal?.aborted && (error === request.signal.reason || error.name === 'AbortError')
+      ? 'cancelled' : 'failed';
+    rawAttempt?.finish(status, error, request.signal);
+    rawLog?.finish(status, error, request.signal);
     if (!analyticsTracked) {
       recordTextTokenStats(config, null);
       trackAiRequest(app, config, { ai_request_type: 'text' });
@@ -1838,7 +1928,7 @@ async function generateOpenAICompatibleImage(app, config, request, provider) {
     const item = responseData.data?.[0] || {};
     const image = await runWithOperationTimeout(
       (signal) => createImageFromOpenAICompatibleItem(item, { signal }),
-      AI_REQUEST_TIMEOUT_MS,
+      IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS * IMAGE_DOWNLOAD_FAMILIES.length,
       request.signal,
     );
 
@@ -2659,7 +2749,7 @@ function createAiService({ app, configStore }) {
         data = await runWithAiRetry(async () => {
           let response = null;
           try {
-            response = await fetch(`${trimBaseUrl(config.base_url)}/models`, {
+            response = await fetchWithRedirect(`${trimBaseUrl(config.base_url)}/models`, {
               method: 'GET',
               headers: createHeaders(config.api_key, config.text_model_provider),
             });
@@ -2683,9 +2773,7 @@ function createAiService({ app, configStore }) {
       return {
         success: true,
         message: '模型列表已更新',
-        models: config.text_model_provider === 'jinlong'
-          ? models.filter((id) => !Object.keys(JINLONG_DEPRECATED_MODEL_MAP).includes(id))
-          : models,
+        models,
       };
     },
 

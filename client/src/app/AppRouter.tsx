@@ -1,7 +1,6 @@
 import type { SectionId } from '../shared/types/navigation';
 import type { SettingsPageRequest } from '../features/settings/types';
 import { getAppMenuItemById } from './menuConfig';
-import BidOpportunityPage from '../features/bid-opportunity/pages/BidOpportunityPage';
 import ContentExpansionReplaceTestPage from '../features/developer/pages/ContentExpansionReplaceTestPage';
 import ContentLayoutBudgetTestPage from '../features/developer/pages/ContentLayoutBudgetTestPage';
 import DeveloperDemoPage, { isDeveloperDemoSection } from '../features/developer/pages/DeveloperDemoPage';
@@ -13,6 +12,7 @@ import DuplicateCheckPage from '../features/duplicate-check/pages/DuplicateCheck
 import CredentialLibraryPage from '../features/credential-library/pages/CredentialLibraryPage';
 import KnowledgeBasePage from '../features/knowledge-base/pages/KnowledgeBasePage';
 import RejectionCheckPage from '../features/rejection-check/pages/RejectionCheckPage';
+import BlindCheckPage from '../features/blind-check/pages/BlindCheckPage';
 import ResourcesPage from '../features/resources/pages/ResourcesPage';
 import PluginsPage from '../features/plugins/pages/PluginsPage';
 import SettingsPage from '../features/settings/pages/SettingsPage';
@@ -58,10 +58,10 @@ function AppRouter({ activeSection, developerMode, onDeveloperModeChange, onSect
       return <DuplicateCheckPage />;
     case 'rejection-check':
       return <RejectionCheckPage />;
+    case 'blind-check':
+      return <BlindCheckPage />;
     case 'template-settings':
       return <MyTemplatesPage />;
-    case 'bid-opportunity':
-      return <BidOpportunityPage />;
     case 'developer-test':
       return null;
     case 'developer-json-test':
@@ -75,7 +75,7 @@ function AppRouter({ activeSection, developerMode, onDeveloperModeChange, onSect
     case 'developer-agent-test':
       return <AgentTestPage />;
     case 'settings':
-      return <SettingsPage onDeveloperModeChange={onDeveloperModeChange} request={settingsRequest} onRequestHandled={onSettingsRequestHandled} />;
+      return <SettingsPage onDeveloperModeChange={onDeveloperModeChange} request={settingsRequest} onRequestHandled={onSettingsRequestHandled} registerLeaveGuard={registerLeaveGuard} />;
     default:
       return null;
   }

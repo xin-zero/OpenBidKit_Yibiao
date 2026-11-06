@@ -5,6 +5,8 @@ export type { AppSwitchProps } from './AppSwitch';
 export { default as EmptyState } from './EmptyState';
 export type { EmptyStateProps } from './EmptyState';
 export { default as InlineSpinner } from './InlineSpinner';
+export { default as OptionCardList } from './OptionCardList';
+export type { OptionCardItem, OptionCardListProps } from './OptionCardList';
 export { default as ProgressBar } from './ProgressBar';
 export type { ProgressBarProps, ProgressBarTone } from './ProgressBar';
 export { UploadBoard, UploadEmpty, UploadFilePill, UploadRow } from './UploadBoard';
@@ -20,6 +22,10 @@ export { default as RestrictedHtmlEditor } from './RestrictedHtmlEditor';
 export type { RestrictedHtmlEditorProps } from './RestrictedHtmlEditor';
 export { default as MarkdownFullscreenViewer } from './MarkdownFullscreenViewer';
 export type { MarkdownFullscreenViewerProps } from './MarkdownFullscreenViewer';
+export { default as EntryBrowserDialog } from './EntryBrowserDialog';
+export type { EntryBrowserDialogProps } from './EntryBrowserDialog';
+export { default as ImagePreviewDialog } from './ImagePreviewDialog';
+export type { ImagePreviewDialogProps, PreviewImage } from './ImagePreviewDialog';
 export type {
   FloatingToolbarAction,
   FloatingToolbarActionVariant,

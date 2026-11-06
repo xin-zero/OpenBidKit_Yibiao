@@ -1,19 +1,20 @@
 import * as Dialog from '@radix-ui/react-dialog';
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
-import { AppDialog, AppSwitch, githubStarNotice, isLibreOfficeRequiredMessage, UploadEmpty, UploadFilePill, UploadRow, useDocumentParseNotice, useNoticeToast, useToast } from '../../../shared/ui';
+import { AppDialog, AppSwitch, isLibreOfficeRequiredMessage, UploadEmpty, UploadFilePill, UploadRow, useDocumentParseNotice, useToast } from '../../../shared/ui';
 import type { ImageModelStatus, OutlineExpansionMode, OutlineMode, OutlineWordControlOptions } from '../../../shared/types';
 import type { ExportTemplateRecord, ExportTemplateScope } from '../../../shared/types/exportFormat';
 import type { KnowledgeBaseIndex, KnowledgeDocument } from '../../knowledge-base/types';
 import type { ContentGenerationOptions, ContentImageQuantity, ContentIllustrationKind, ContentTableRequirement, GlobalFactsMode, TechnicalPlanOriginalPlanFile, TechnicalPlanState } from '../types';
 import { DEFAULT_HTML_IMAGE_TYPES, normalizeContentGenerationOptions } from '../contentGenerationOptions';
+import { generationSettingsTabs as tabs, type GenerationSettingsTab } from '../generationSettingsTabs';
+import { IMAGE_LAYOUTS, getDefaultImageLayoutShares, resolveImageLayoutShares, type ImageLayoutKey } from '../../../../electron/shared/imageLayout/index.mjs';
 import aiImageExampleUrl from '../../../../assets/generate_img_example/ai.png';
 import mermaidImageExampleUrl from '../../../../assets/generate_img_example/mermaid.png';
 import htmlImageExampleUrl from '../../../../assets/generate_img_example/html.png';
 
-type GenerationSettingsTab = 'content' | 'existing-plan' | 'knowledge' | 'length' | 'illustration' | 'writing' | 'appearance';
-
 interface GenerationSettingsPageProps {
-  initialTab?: GenerationSettingsTab;
+  activeTab: GenerationSettingsTab;
+  onActiveTabChange: (tab: GenerationSettingsTab) => void;
   originalPlanFile: TechnicalPlanOriginalPlanFile | null;
   outlineMode: OutlineMode;
   outlineModeRequiresRegeneration: boolean;
@@ -50,24 +51,13 @@ interface WordControlDraft {
   sectionWords: string;
 }
 
-const tabs: Array<{ id: GenerationSettingsTab; label: string }> = [
-  { id: 'content', label: '写嘛' },
-  { id: 'existing-plan', label: '我有方案' },
-  { id: 'knowledge', label: '知识库' },
-  { id: 'length', label: '写多少' },
-  { id: 'illustration', label: '插图吗' },
-  { id: 'writing', label: '怎么写' },
-  { id: 'appearance', label: '长嘛样' },
-];
 const emptyKnowledgeIndex: KnowledgeBaseIndex = { folders: [], documents: [] };
 
-// locked 表示功能尚未开发完成，只提示开发中，不允许选择。
-const documentOptions: Array<{ value: OutlineMode; title: string; description: string; locked?: boolean }> = [
+const documentOptions: Array<{ value: OutlineMode; title: string; description: string }> = [
   {
     value: 'response-file',
     title: '完整投标文件',
     description: '按照招标文件响应要求完整生成',
-    locked: true,
   },
   {
     value: 'standalone-technical',
@@ -78,7 +68,6 @@ const documentOptions: Array<{ value: OutlineMode; title: string; description: s
     value: 'standalone-business',
     title: '商务标独立成册',
     description: '按照招标文件响应要求仅生成商务部分',
-    locked: true,
   },
 ];
 const outlineExpansionModeLabels: Record<OutlineExpansionMode, string> = {
@@ -114,6 +103,17 @@ const globalFactsModeOptions: Array<{ value: GlobalFactsMode; title: string; des
     description: '选题范围与胡咧咧模式相同。未在参考材料中找到具体值时，仍会保留该项，并将值标记为【待填写】。如：涉及人员名单但用户未提供，会保留岗位事实并写成【待填写】。用户需要二次修改后再进入正文生成阶段。正文生产时的任何不确定项也会使用【待填写】占位。',
   },
 ];
+// 页签第二行只放短名，避免挤占页签宽度。
+const outlineModeSummaryLabels: Record<OutlineMode, string> = {
+  'response-file': '完整标',
+  'standalone-technical': '技术标',
+  'standalone-business': '商务标',
+};
+const globalFactsModeSummaryLabels: Record<GlobalFactsMode, string> = {
+  fabricate: '胡咧咧',
+  omit: '别招欠',
+  placeholder: '放着我来',
+};
 const tableRequirementOptions: Array<{ value: ContentTableRequirement; label: string }> = [
   { value: 'none', label: '不要' },
   { value: 'light', label: '少量' },
@@ -124,6 +124,12 @@ const imageModelStatusLabels: Record<ImageModelStatus, string> = {
   untested: '未测试',
   available: '可用',
   unavailable: '不可用',
+};
+const imageLayoutLabels: Record<ImageLayoutKey, string> = {
+  single: '单张图片',
+  imageText: '图片表格',
+  threeImages: '三列图片',
+  fourImages: '四宫格',
 };
 const imageGenerationExamples: Record<ContentIllustrationKind, { src: string; alt: string }> = {
   ai: { src: aiImageExampleUrl, alt: 'AI 生图示例' },
@@ -188,6 +194,15 @@ function getEstimatedPages(minimumWords: number, maximumWords: number) {
   return baseWords > 0 ? Math.ceil(baseWords / 650) : null;
 }
 
+function formatWordRangeSummary({ minimumWords, maximumWords }: OutlineWordControlOptions) {
+  const minimum = formatWordCountDraft(minimumWords);
+  const maximum = formatWordCountDraft(maximumWords);
+  if (minimumWords > 0 && maximumWords > 0) return `${minimum}~${maximum}万`;
+  if (minimumWords > 0) return `≥${minimum}万`;
+  if (maximumWords > 0) return `≤${maximum}万`;
+  return '不限';
+}
+
 function areWordControlOptionsEqual(left?: OutlineWordControlOptions, right?: OutlineWordControlOptions) {
   return Boolean(left && right
     && left.minimumWords === right.minimumWords
@@ -212,7 +227,8 @@ function normalizeGlobalFactsMode(value: GlobalFactsMode | undefined): GlobalFac
 
 // 汇总生成前配置，并管理已有方案与参考知识库。
 function GenerationSettingsPage({
-  initialTab = 'content',
+  activeTab,
+  onActiveTabChange,
   originalPlanFile,
   outlineMode,
   outlineModeRequiresRegeneration,
@@ -242,7 +258,6 @@ function GenerationSettingsPage({
   onCreateExportTemplate,
   onContentGenerationOptionsChange,
 }: GenerationSettingsPageProps) {
-  const [activeTab, setActiveTab] = useState<GenerationSettingsTab>(initialTab);
   const [originalPlanBusy, setOriginalPlanBusy] = useState(false);
   const [outlineModeBusy, setOutlineModeBusy] = useState(false);
   const [outlineExpansionModeBusy, setOutlineExpansionModeBusy] = useState(false);
@@ -272,7 +287,6 @@ function GenerationSettingsPage({
   const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null);
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
   const { showToast } = useToast();
-  const showNotice = useNoticeToast();
   const { showDocumentParseNotice } = useDocumentParseNotice();
   const activeTabLabel = tabs.find((tab) => tab.id === activeTab)?.label || '';
   const parsedDraftMinimumWords = parseWordCountDraft(draftMinimumWords) ?? 0;
@@ -293,7 +307,21 @@ function GenerationSettingsPage({
     contentGenerationOptions,
     imageModelAvailable,
   );
+  // 布局份额与 Main 名额计算共用同一公式；档位默认份额为 0 的布局不可开启。
+  const defaultImageLayoutShares = getDefaultImageLayoutShares(draftIllustrationOptions.imageQuantity);
+  const imageLayoutShares = resolveImageLayoutShares(draftIllustrationOptions);
+  const enabledImageLayoutCount = IMAGE_LAYOUTS.filter(({ key }) => imageLayoutShares[key] > 0).length;
   const selectedExportTemplate = exportTemplates.find((template) => template.template_id === exportTemplateId) || null;
+  // 页签第二行“功能词·当前值”只读取已保存配置，输入中的草稿不提前展示。
+  const tabSummaries: Record<GenerationSettingsTab, string> = {
+    content: `范围·${outlineModeSummaryLabels[outlineMode]}`,
+    'existing-plan': `原方案·${originalPlanFile ? '已上传' : '未上传'}`,
+    knowledge: `参考·${referenceKnowledgeDocumentIds.length ? `${referenceKnowledgeDocumentIds.length}个` : '未选'}`,
+    length: `字数·${formatWordRangeSummary(outlineWordControlOptions)}`,
+    illustration: `配图·${currentContentGenerationOptions.imageQuantity > 0 ? `${currentContentGenerationOptions.imageQuantity}%` : '无'}`,
+    writing: `补全·${globalFactsModeSummaryLabels[normalizeGlobalFactsMode(globalFactsMode)]}`,
+    appearance: `模板·${selectedExportTemplate?.template_name || (exportTemplatesLoading ? '读取中' : '未选')}`,
+  };
 
   useEffect(() => {
     setDraftMinimumWords(formatWordCountDraft(outlineWordControlOptions.minimumWords));
@@ -322,6 +350,11 @@ function GenerationSettingsPage({
     setDraftIllustrationOptions(nextOptions);
   }, [contentGenerationOptions, imageModelAvailable]);
 
+  // 工具条逐项切换时，窄窗口下把当前页签滚入可视区域。
+  useEffect(() => {
+    document.getElementById(`generation-settings-tab-${activeTab}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeTab]);
+
   useEffect(() => {
     if (activeTab !== 'knowledge') return;
     setDraftKnowledgeDocumentIds(referenceKnowledgeDocumentIds);
@@ -343,7 +376,7 @@ function GenerationSettingsPage({
 
     event.preventDefault();
     const nextTab = tabs[nextIndex];
-    setActiveTab(nextTab.id);
+    onActiveTabChange(nextTab.id);
     document.getElementById(`generation-settings-tab-${nextTab.id}`)?.focus();
   };
 
@@ -570,6 +603,43 @@ function GenerationSettingsPage({
     }
   };
 
+  // 改为 0 时关闭全部生图方式；从 0（或无任何生图方式）改为非 0 时恢复默认开启；非 0 档位之间切换保留用户已选的生图方式。
+  const changeImageQuantity = (imageQuantity: ContentImageQuantity) => {
+    const enabled = imageQuantity > 0;
+    const restoreDefaults = draftIllustrationOptions.imageQuantity <= 0 || !(draftIllustrationOptions.useAiImages
+      || draftIllustrationOptions.useMermaidImages || draftIllustrationOptions.useHtmlImages);
+    void saveContentOptions({
+      ...draftIllustrationOptions,
+      tableRequirement: draftTableRequirement,
+      imageQuantity,
+      useAiImages: enabled && (restoreDefaults ? imageModelAvailable : draftIllustrationOptions.useAiImages),
+      useMermaidImages: enabled && (restoreDefaults || draftIllustrationOptions.useMermaidImages),
+      useHtmlImages: enabled && (restoreDefaults || draftIllustrationOptions.useHtmlImages),
+      useSingleImageLayout: true,
+      useImageTextLayout: true,
+      useThreeImagesLayout: true,
+      useFourImagesLayout: true,
+    });
+  };
+
+  // 配图比例不为 0 时至少保留一种生图方式；AI 生图仅在模型可用时允许开启，均只在前端校验。
+  const toggleImageGenerationType = (key: 'useAiImages' | 'useMermaidImages' | 'useHtmlImages', checked: boolean) => {
+    if (checked && key === 'useAiImages' && !imageModelAvailable) {
+      showToast('AI生图不可用，请前往设置中配置生图模型', 'info');
+      return;
+    }
+    const enabledCount = [draftIllustrationOptions.useAiImages, draftIllustrationOptions.useMermaidImages, draftIllustrationOptions.useHtmlImages].filter(Boolean).length;
+    if (!checked && draftIllustrationOptions.imageQuantity > 0 && enabledCount <= 1) {
+      showToast('配图比例不为 0 时，至少保留一种生图方式', 'info');
+      return;
+    }
+    void saveContentOptions({
+      ...draftIllustrationOptions,
+      tableRequirement: draftTableRequirement,
+      [key]: checked,
+    });
+  };
+
   const openHtmlImageTypesDialog = () => {
     setHtmlImageTypesDraft(draftIllustrationOptions.htmlImageTypes);
     setHtmlImageTypesDialogOpen(true);
@@ -748,10 +818,12 @@ function GenerationSettingsPage({
                 role="tab"
                 tabIndex={active ? 0 : -1}
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                title={`${tab.label}：${tabSummaries[tab.id]}`}
+                onClick={() => onActiveTabChange(tab.id)}
                 onKeyDown={(event) => handleTabKeyDown(event, index)}
               >
-                {tab.label}
+                <span className="generation-settings-tab-label">{tab.label}</span>
+                <small className="generation-settings-tab-summary">{tabSummaries[tab.id]}</small>
               </button>
             );
           })}
@@ -770,9 +842,8 @@ function GenerationSettingsPage({
               <legend className="sr-only">选择投标文件生成范围</legend>
               {documentOptions.map((option, index) => (
                 <label
-                  className={`generation-settings-option${outlineMode === option.value ? ' is-selected' : ''}${option.locked ? ' is-locked' : ''}`}
+                  className={`generation-settings-option${outlineMode === option.value ? ' is-selected' : ''}`}
                   key={option.value}
-                  onClick={option.locked ? () => showNotice(githubStarNotice) : undefined}
                 >
                   <span>{String(index + 1).padStart(2, '0')}</span>
                   <input
@@ -780,7 +851,6 @@ function GenerationSettingsPage({
                     name="technical-plan-outline-mode"
                     value={option.value}
                     checked={outlineMode === option.value}
-                    disabled={option.locked}
                     onChange={() => void saveOutlineMode(option.value)}
                   />
                   <strong>{option.title}</strong>
@@ -963,20 +1033,43 @@ function GenerationSettingsPage({
                     <select
                       value={draftIllustrationOptions.imageQuantity}
                       disabled={contentConfigLocked || contentOptionsBusy}
-                      onChange={(event) => void saveContentOptions({
-                        ...draftIllustrationOptions,
-                        tableRequirement: draftTableRequirement,
-                        imageQuantity: Number(event.target.value) as ContentImageQuantity,
-                        useAiImages: Number(event.target.value) > 0 && imageModelAvailable,
-                        useMermaidImages: Number(event.target.value) > 0,
-                        useHtmlImages: Number(event.target.value) > 0,
-                      })}
+                      onChange={(event) => void changeImageQuantity(Number(event.target.value) as ContentImageQuantity)}
                     >
                       {Array.from({ length: 11 }, (_, index) => index * 10).map((ratio) => (
                         <option value={ratio} key={ratio}>{ratio}%</option>
                       ))}
                     </select>
                   </label>
+                </div>
+                <div className="content-generation-config-group generation-settings-image-layout-group">
+                  <div className="generation-settings-image-layout-head">
+                    <strong>配图布局</strong>
+                    <small>参与配图的小节按以下占比分配布局；关闭某类布局后，其占比均分给其他开启的布局。</small>
+                  </div>
+                  {IMAGE_LAYOUTS.map(({ key, optionKey }) => {
+                    const checked = imageLayoutShares[key] > 0;
+                    const available = defaultImageLayoutShares[key] > 0;
+                    const isLastEnabled = checked && enabledImageLayoutCount === 1;
+                    const hint = !available ? '当前配图比例下不使用' : isLastEnabled ? '至少保留一种布局' : '';
+                    return (
+                      <div className="content-generation-config-row" key={key}>
+                        <span><strong>{imageLayoutLabels[key]}</strong>{hint && <small>{hint}</small>}</span>
+                        <div className="content-generation-config-control">
+                          <em className="content-image-layout-share">{imageLayoutShares[key]}%</em>
+                          <AppSwitch
+                            checked={checked}
+                            disabled={contentConfigLocked || contentOptionsBusy || !available || isLastEnabled}
+                            onCheckedChange={(nextChecked) => void saveContentOptions({
+                              ...draftIllustrationOptions,
+                              tableRequirement: draftTableRequirement,
+                              [optionKey]: nextChecked,
+                            })}
+                            aria-label={`是否使用${imageLayoutLabels[key]}布局`}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
                 <div className="content-generation-config-group">
                   <div className="content-generation-config-row">
@@ -990,12 +1083,8 @@ function GenerationSettingsPage({
                       <em className={`content-image-status is-${imageModelStatus}`}>{imageModelStatusLabels[imageModelStatus]}</em>
                       <AppSwitch
                         checked={draftIllustrationOptions.useAiImages}
-                        disabled={contentConfigLocked || contentOptionsBusy || (!imageModelAvailable && !draftIllustrationOptions.useAiImages)}
-                        onCheckedChange={(checked) => void saveContentOptions({
-                          ...draftIllustrationOptions,
-                          tableRequirement: draftTableRequirement,
-                          useAiImages: checked,
-                        })}
+                        disabled={contentConfigLocked || contentOptionsBusy}
+                        onCheckedChange={(checked) => toggleImageGenerationType('useAiImages', checked)}
                         aria-label="是否使用 AI 生图"
                       />
                     </div>
@@ -1012,11 +1101,7 @@ function GenerationSettingsPage({
                     <AppSwitch
                       checked={draftIllustrationOptions.useMermaidImages}
                       disabled={contentConfigLocked || contentOptionsBusy}
-                      onCheckedChange={(checked) => void saveContentOptions({
-                        ...draftIllustrationOptions,
-                        tableRequirement: draftTableRequirement,
-                        useMermaidImages: checked,
-                      })}
+                      onCheckedChange={(checked) => toggleImageGenerationType('useMermaidImages', checked)}
                       aria-label="是否使用 Mermaid 生图"
                     />
                   </div>
@@ -1032,11 +1117,7 @@ function GenerationSettingsPage({
                     <AppSwitch
                       checked={draftIllustrationOptions.useHtmlImages}
                       disabled={contentConfigLocked || contentOptionsBusy}
-                      onCheckedChange={(checked) => void saveContentOptions({
-                        ...draftIllustrationOptions,
-                        tableRequirement: draftTableRequirement,
-                        useHtmlImages: checked,
-                      })}
+                      onCheckedChange={(checked) => toggleImageGenerationType('useHtmlImages', checked)}
                       aria-label="是否生成 HTML 图片"
                     />
                   </div>
@@ -1116,7 +1197,7 @@ function GenerationSettingsPage({
               <section className="generation-settings-export-template-section">
                 <div className="generation-settings-appearance-head">
                   <strong id="generation-settings-export-template-scope-label">模板样式范围</strong>
-                  <span id="generation-settings-export-template-scope-description">纸张、方向、双栏和页边距始终应用于整个文件；其余样式（包括页眉页脚、页码和首页不同）遵循所选范围。选择仅技术方案时，AI 与非 AI 范围交界处另起页。</span>
+                  <span id="generation-settings-export-template-scope-description">纸张、方向、双栏、页边距、一级标题另起页和各级标题样式（首行缩进除外）始终应用于整个文件；其余样式（包括页眉页脚、页码和首页不同）遵循所选范围。选择仅技术方案时，AI 与非 AI 范围交界处另起页。</span>
                 </div>
                 <div className="generation-settings-export-template-control">
                   <select

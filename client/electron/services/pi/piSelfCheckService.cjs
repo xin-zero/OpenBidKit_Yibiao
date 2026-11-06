@@ -10,6 +10,7 @@ const {
   NATIVE_AGENT_TOOLS,
 } = require('../agent/agentToolEnvironment.cjs');
 const { PI_RETRY_ERROR_NORMALIZER_PATH } = require('./piRetryErrorNormalizer.cjs');
+const { fetchWithRedirect } = require('../../utils/fetchWithRedirect.cjs');
 
 const EXPECTED_PI_TOOLS = [...NATIVE_AGENT_TOOLS, 'json-validation', 'ask-user', 'report-failure'];
 const CRITICAL_COMMANDS = new Set(['node', ...BUNDLED_COMMANDS]);
@@ -439,7 +440,7 @@ async function runTextModelProbe(config, options) {
       }];
     }
 
-    const response = await fetch(`${trimBaseUrl(config.base_url)}/chat/completions`, {
+    const response = await fetchWithRedirect(`${trimBaseUrl(config.base_url)}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -450,7 +451,8 @@ async function runTextModelProbe(config, options) {
       signal: timeout.signal,
     });
     const rawText = await response.text();
-    const payloads = options.stream
+    // 易标官方服务忽略 stream 参数、始终返回 SSE，按响应类型解析。
+    const payloads = options.stream || String(response.headers.get('content-type') || '').includes('text/event-stream')
       ? parseSsePayloads(rawText)
       : (() => {
         try { return rawText ? [JSON.parse(rawText)] : []; } catch { return []; }

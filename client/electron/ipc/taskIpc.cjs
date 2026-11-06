@@ -21,6 +21,22 @@ function registerTaskIpc({ taskService }) {
     taskService.subscribe(event.sender);
     return taskService.suppressOutlineSelectionAutoConfirmation(payload);
   });
+  ipcMain.handle('tasks:confirm-business-fill-review', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.confirmBusinessFillReview(payload);
+  });
+  ipcMain.handle('tasks:suppress-business-fill-review-auto-confirmation', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.suppressBusinessFillReviewAutoConfirmation(payload);
+  });
+  ipcMain.handle('tasks:start-rule-page-compile', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.startRulePageCompile(payload);
+  });
+  ipcMain.handle('tasks:start-bid-template-extraction', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.startBidTemplateExtraction(payload);
+  });
   ipcMain.handle('tasks:start-global-facts-generation', (event, payload) => {
     taskService.subscribe(event.sender);
     return taskService.startGlobalFactsGeneration(payload);
@@ -44,6 +60,18 @@ function registerTaskIpc({ taskService }) {
   ipcMain.handle('tasks:start-duplicate-analysis', (event, payload) => {
     taskService.subscribe(event.sender);
     return taskService.startDuplicateAnalysis(payload);
+  });
+  ipcMain.handle('tasks:start-blind-check', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.startBlindCheck(payload);
+  });
+  ipcMain.handle('tasks:start-blind-check-fix', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.startBlindCheckFix(payload);
+  });
+  ipcMain.handle('tasks:start-blind-check-preset-extraction', (event, payload) => {
+    taskService.subscribe(event.sender);
+    return taskService.startBlindCheckPresetExtraction(payload);
   });
   ipcMain.handle('tasks:start-feasibility-analysis', (event, payload) => {
     taskService.subscribe(event.sender);

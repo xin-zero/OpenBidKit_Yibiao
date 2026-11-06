@@ -18,6 +18,11 @@ function getOfficialRechargeQrCachePath(app) {
   return path.join(getUserDataPath(app), 'official_recharge_qr_cache.json');
 }
 
+/** 自动公告的媒体缓存独立于业务工作区。 */
+function getNoticeCacheDir(app) {
+  return path.join(getUserDataPath(app), 'notice-cache');
+}
+
 function getLicenseFilePath(app) {
   return path.join(getUserDataPath(app), 'license.json');
 }
@@ -79,6 +84,11 @@ function getTechnicalPlanBidTemplateFieldsPath(app) {
   return path.join(getTechnicalPlanDir(app), 'bid-template-fields.json');
 }
 
+/** 投标模版的空白底稿，商务模版回填和失效都以它为基准重新生成最终模版。 */
+function getTechnicalPlanBidTemplateBlankPath(app) {
+  return path.join(getTechnicalPlanDir(app), 'bid-template-blank.docx');
+}
+
 function getTechnicalPlanOriginalPlanMarkdownPath(app) {
   return path.join(getTechnicalPlanDir(app), 'original-plan.md');
 }
@@ -93,6 +103,25 @@ function getDuplicateCheckContentDir(app) {
 
 function getRejectionCheckDir(app) {
   return path.join(getWorkspaceDir(app), 'rejection-check');
+}
+
+function getBlindCheckDir(app) {
+  return path.join(getWorkspaceDir(app), 'blind-check');
+}
+
+/** 暗标检查的待检文档副本目录。 */
+function getBlindCheckSourceDir(app) {
+  return path.join(getBlindCheckDir(app), 'source');
+}
+
+/** 暗标自动修复写出的副本目录，原文件不改动。 */
+function getBlindCheckFixedDir(app) {
+  return path.join(getBlindCheckDir(app), 'fixed');
+}
+
+/** AI 提取预设时保存的招标文件正文（按预设 ID 命名），AI 复核对照招标原文用；随预设保留，重置检查不清理。 */
+function getBlindCheckTenderDir(app) {
+  return path.join(getWorkspaceDir(app), 'blind-check-tenders');
 }
 
 function getRejectionCheckDocumentMarkdownPath(app, role, documentId) {
@@ -127,6 +156,11 @@ function getCredentialLibraryDir(app) {
 
 function getAiLogsDir(app) {
   return path.join(getUserDataPath(app), 'logs', 'ai');
+}
+
+// 完整接口日志与现有 AI 摘要日志分目录保存。
+function getAiRawLogsDir(app) {
+  return path.join(getUserDataPath(app), 'logs', 'ai-raw');
 }
 
 function getDeveloperLogsDir(app, moduleName) {
@@ -202,6 +236,11 @@ function getBundledOpenXmlHelperPath(app) {
 module.exports = {
   getAgentRuntimeDir,
   getAiLogsDir,
+  getAiRawLogsDir,
+  getBlindCheckDir,
+  getBlindCheckSourceDir,
+  getBlindCheckFixedDir,
+  getBlindCheckTenderDir,
   getBundledAgentToolsBinDir,
   getBundledOpenXmlHelperDir,
   getBundledOpenXmlHelperPath,
@@ -218,6 +257,7 @@ module.exports = {
   getImportedImagesDir,
   getKnowledgeBaseDir,
   getLicenseFilePath,
+  getNoticeCacheDir,
   getOfficialApiSessionFilePath,
   getOfficialRechargeQrCachePath,
   getOpenXmlHelperDebugExecutablePath,
@@ -232,6 +272,7 @@ module.exports = {
   getTechnicalPlanBidTemplatePath,
   getTechnicalPlanBidTemplateSourcePath,
   getTechnicalPlanBidTemplateFieldsPath,
+  getTechnicalPlanBidTemplateBlankPath,
   getTechnicalPlanTenderMarkdownPath,
   getTechnicalPlanTenderOriginalsDir,
   getWorkspaceDir,

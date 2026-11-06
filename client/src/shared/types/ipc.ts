@@ -1,14 +1,16 @@
 import type { AiHttpErrorPayload, ChatCompletionRequest, JsonCompletionRequest } from './ai';
-import type { OfficialTransactionsPage, OfficialInvoiceApplicationInput, OfficialInvoiceInfo, OfficialAccountState, OfficialEmailCredentials, OfficialEmailPurpose, OfficialRechargeOption, OfficialRechargeOrder } from './officialAccount';
+import type { OfficialConsumeRecord, OfficialInvoiceApplication, OfficialInvoiceApplicationInput, OfficialInvoiceInfo, OfficialAccountState, OfficialEmailCredentials, OfficialEmailPurpose, OfficialPage, OfficialPageQuery, OfficialRechargeOption, OfficialRechargeOrder } from './officialAccount';
 import type { DuplicateCheckWorkspacePatch, DuplicateCheckWorkspaceState, FileSelectionResult } from './bid';
 import type { ClientConfig, ConfigSaveResult, ImageModelTestResult, ModelInfoResult, ModelListResult, UpdateChannel } from './config';
 import type { KnowledgeAnalysisSnapshot, KnowledgeBaseEvent, KnowledgeBaseIndex, KnowledgeBaseIndexMutationResult, KnowledgeBaseMutationResult, KnowledgeBaseSearchRequest, KnowledgeBaseSearchPage, KnowledgeBaseRetryDocumentResult, KnowledgeBaseStartMatchingResult, KnowledgeBaseUploadResult, KnowledgeDocument, KnowledgeFolder, KnowledgeItem } from '../../features/knowledge-base/types';
 import type { RejectionCheckWorkspacePatch, RejectionCheckWorkspaceState, RejectionDocumentRole } from '../../features/rejection-check/types';
-import type { BidAnalysisMode, BidAnalysisTaskState, BidSectionMode, ContentGenerationOptions, ContentGenerationPlanState, ContentGenerationProgressDetail, ContentGenerationRuntimeState, ContentGenerationSectionState, DetectedBidSection, GlobalFactGroupState, SaveOutlineRequest, SaveOutlineSelectionRequest, TechnicalPlanGenerationConfig, TechnicalPlanState, TechnicalPlanStep } from '../../features/technical-plan/types';
+import type { BlindCheckCredentialWord, BlindCheckPreset, BlindCheckProfile, BlindCheckTenderSources, BlindCheckWorkspacePatch, BlindCheckWorkspaceState } from '../../features/blind-check/types';
+import type { BidAnalysisMode, BidAnalysisTaskState, BidSectionMode, BidTemplateInspection, BusinessFillReview, BusinessFillReviewSubmission, ContentGenerationOptions, ContentGenerationPlanState, ContentGenerationProgressDetail, ContentGenerationRuntimeState, ContentGenerationSectionState, DetectedBidSection, GlobalFactGroupState, SaveOutlineRequest, SaveOutlineSelectionRequest, TechnicalPlanGenerationConfig, TechnicalPlanState, TechnicalPlanStep } from '../../features/technical-plan/types';
 import type { FeasibilityProjectInfo, FeasibilityReportState, FeasibilityReportStep, FeasibilitySaveOutlineRequest, FeasibilitySourceFile } from '../../features/feasibility-report/types';
 import type { CredentialCertificate, CredentialEmployee, CredentialImageFieldKey, CredentialLibraryImportResult, CredentialLibraryMutationResult, CredentialLibraryProfile, CredentialLibrarySnapshot, CredentialOtherMaterial, CredentialProject, CredentialRecordSavePayload } from '../../features/credential-library/types';
 import type { ExportFormatConfig, ExportTemplateRecord } from './exportFormat';
 import type { TechnicalPlanOutlineData as OutlineData } from './outline';
+import type { NoticeCachedMedia, NoticeMediaCacheRequest } from './notice';
 
 /** 配置保存只更新提交字段，文本服务商档案也支持局部更新。 */
 export type ClientConfigPatch = Partial<Omit<ClientConfig, 'text_model_profiles'>> & {
@@ -43,6 +45,8 @@ export interface TaskEvent<TState = unknown, TRejectionCheckState = unknown, TDu
   rejectionCheckPatch?: RejectionCheckWorkspacePatch;
   duplicateCheck?: TDuplicateCheckState;
   duplicateCheckPatch?: DuplicateCheckWorkspacePatch;
+  blindCheck?: BlindCheckWorkspaceState;
+  blindCheckPatch?: BlindCheckWorkspacePatch;
   feasibilityReportPatch?: Partial<FeasibilityReportState>;
 }
 
@@ -54,21 +58,12 @@ export interface WordExportProgressEvent {
   warnings?: string[];
 }
 
-/** 整本导出前发现的正文结构问题，按小节汇总。 */
-export interface WordExportStructureIssue {
-  section: string;
-  problems: string[];
-}
-
 export interface WordExportResult {
   success: boolean;
   canceled?: boolean;
   path?: string;
   message?: string;
   warnings?: string[];
-  /** 为 true 时尚未导出，需用户确认结构问题后带 confirmStructureIssues 再次调用。 */
-  needsConfirmation?: boolean;
-  issues?: WordExportStructureIssue[];
 }
 
 export interface CheckResultExportResult {
@@ -212,6 +207,39 @@ export interface WorkspaceDatabaseStatus {
   migrationDescription?: string;
 }
 
+export type StorageUsageGroupId = 'protected' | 'legacy' | 'temporary';
+export type StorageCleanGroupId = Exclude<StorageUsageGroupId, 'protected'>;
+
+export interface StorageUsageItem {
+  id: string;
+  label: string;
+  description: string;
+  bytes: number;
+}
+
+export interface StorageUsageGroup {
+  id: StorageUsageGroupId;
+  label: string;
+  description: string;
+  bytes: number;
+  items: StorageUsageItem[];
+}
+
+export interface StorageUsage {
+  groups: StorageUsageGroup[];
+  totalBytes: number;
+  scannedAt: string;
+}
+
+export interface StorageCleanResult {
+  freedBytes: number;
+  /** 被占用或无权限而未删除的条目数。 */
+  failedCount: number;
+  /** 因相关任务运行中而整体跳过的清理项。 */
+  skipped: Array<{ label: string; reason: string }>;
+  usage: StorageUsage;
+}
+
 export type AgentSelfCheckStepStatus = 'pending' | 'running' | 'success' | 'warning' | 'error' | 'skipped';
 export type AgentSelfCheckStatus = 'normal' | 'error' | 'busy';
 
@@ -335,6 +363,8 @@ export interface AgentRunFile {
 }
 
 export interface AgentRunPayload {
+  /** 为本次任务启用 Parallel 公开网页搜索和读取，默认关闭。 */
+  parallel_search?: boolean;
   task_id?: string;
   title?: string;
   task?: string;
@@ -587,6 +617,11 @@ export interface YibiaoBridge {
   requiredOnlineServices: {
     getStatus: () => Promise<RequiredOnlineServicesStatus>;
   };
+  notice: {
+    syncCurrent: (request: { projectName: string; noticeId: string | null }) => Promise<void>;
+    prepareMedia: (request: NoticeMediaCacheRequest) => Promise<NoticeCachedMedia>;
+    releaseMedia: (leaseId: string) => Promise<void>;
+  };
   donation: {
     getConfig: () => Promise<DonationPaymentConfig>;
     createTip: (request: DonationCreateRequest) => Promise<DonationIntent>;
@@ -619,6 +654,10 @@ export interface YibiaoBridge {
     getModelInfo: (modelName: string) => Promise<ModelInfoResult>;
     openConfigFolder: () => Promise<{ success: boolean; path: string }>;
   };
+  storage: {
+    getUsage: () => Promise<StorageUsage>;
+    clean: (groupId: StorageCleanGroupId) => Promise<StorageCleanResult>;
+  };
   license: {
     getStatus: () => Promise<LicenseRuntimeStatus>;
     refresh: () => Promise<LicenseRuntimeStatus>;
@@ -626,19 +665,20 @@ export interface YibiaoBridge {
     activateOfflineCode: (code: string) => Promise<LicenseOfflineActivationResult>;
   };
   officialAccount: {
-    redeemCode: (input: { code: string; requestNo: string }) => Promise<{ redeemedPoint: string }>;
+    redeemCode: (input: { code: string }) => Promise<{ redeemedPoint: string }>;
+    getInvoiceApplication: (orderNo: string) => Promise<OfficialInvoiceApplication | null>;
     createInvoiceApplication: (input: OfficialInvoiceApplicationInput) => Promise<void>;
     getInvoiceInfo: () => Promise<OfficialInvoiceInfo>;
     saveInvoiceInfo: (input: OfficialInvoiceInfo) => Promise<void>;
     getState: () => Promise<OfficialAccountState>;
     refreshBalance: () => Promise<OfficialAccountState>;
     getRechargeOptions: () => Promise<OfficialRechargeOption[]>;
-    createRechargeOrder: (input: { optionId: string }) => Promise<OfficialRechargeOrder>;
-    getRechargeOrders: () => Promise<OfficialRechargeOrder[]>;
-    getTransactions: (page: number) => Promise<OfficialTransactionsPage>;
-    getRechargeOrder: (id: string) => Promise<OfficialRechargeOrder>;
-    closeRechargeOrder: (id: string) => Promise<OfficialRechargeOrder>;
-    onRechargeOrderChanged: (callback: (order: OfficialRechargeOrder) => void) => () => void;
+    createRechargeOrder: (input: { productId: string }) => Promise<OfficialRechargeOrder>;
+    getRechargeOrders: (input: OfficialPageQuery) => Promise<OfficialPage<OfficialRechargeOrder>>;
+    getTransactions: (input: OfficialPageQuery) => Promise<OfficialPage<OfficialConsumeRecord>>;
+    getRechargeOrder: (orderNo: string) => Promise<OfficialRechargeOrder>;
+    closeRechargeOrder: (orderNo: string) => Promise<OfficialRechargeOrder>;
+    onRechargeOrderChanged: (callback: (order: OfficialRechargeOrder, created: boolean) => void) => () => void;
     onStateChanged: (callback: (state: OfficialAccountState) => void) => () => void;
     sendEmailCode: (input: { email: string; purpose: OfficialEmailPurpose }) => Promise<boolean>;
     loginWithEmail: (input: OfficialEmailCredentials) => Promise<OfficialAccountState>;
@@ -695,6 +735,9 @@ export interface YibiaoBridge {
   };
   file: {
     selectDuplicateCheckFiles: (options?: { multiple?: boolean; filePaths?: string[] }) => Promise<FileSelectionResult>;
+    /** 暗标合规检查只接受单个 .docx。 */
+    selectBlindCheckFile: (options?: { filePaths?: string[] }) => Promise<FileSelectionResult>;
+    selectBlindCheckTenderFile: () => Promise<FileSelectionResult>;
     /** 把拖拽进来的 File 对象换成本地绝对路径，供各上传区拖拽导入使用 */
     getPathForFile: (file: File) => string;
   };
@@ -757,6 +800,7 @@ export interface YibiaoBridge {
     readTenderMarkdown: () => Promise<string>;
     readContentWord: (sectionId: string) => Promise<Uint8Array | null>;
     previewContentWord: (sectionId: string) => Promise<Uint8Array | null>;
+    previewBusinessChapterWord: (nodeId: string) => Promise<Uint8Array | null>;
     readTenderSourceMarkdown: (sourceId: string) => Promise<string>;
     updateStep: (step: TechnicalPlanStep) => Promise<void>;
     saveBidAnalysisConfig: (payload: { mode: BidAnalysisMode; selectedTaskIds: string[]; bidSectionMode?: BidSectionMode }) => Promise<void>;
@@ -764,10 +808,12 @@ export interface YibiaoBridge {
     saveOutline: (payload: SaveOutlineRequest) => Promise<Partial<TechnicalPlanState>>;
     saveGlobalFacts: (globalFacts: GlobalFactGroupState[]) => Promise<Partial<TechnicalPlanState>>;
     saveContentGenerationOptions: (options: ContentGenerationOptions) => Promise<Partial<TechnicalPlanState>>;
-    saveChapterContent: (payload: { nodeId: string; content: string }) => Promise<Partial<TechnicalPlanState>>;
     resetContentGeneration: () => Promise<TechnicalPlanState>;
     clear: () => Promise<{ success: boolean; message?: string }>;
+    inspectBidTemplate: () => Promise<BidTemplateInspection>;
     openBidTemplate: () => Promise<{ success: boolean; message?: string }>;
+    getBusinessFillReview: () => Promise<BusinessFillReview>;
+    saveBusinessFillReview: (payload: BusinessFillReviewSubmission) => Promise<Partial<TechnicalPlanState>>;
   };
   feasibilityReport: {
     loadState: () => Promise<FeasibilityReportState>;
@@ -802,6 +848,27 @@ export interface YibiaoBridge {
     exportExcel: (request: { rejectionInputSignature: string; bidSignature: string }) => Promise<CheckResultExportResult>;
     clear: () => Promise<{ success: boolean; message?: string }>;
   };
+  blindCheck: {
+    loadState: () => Promise<BlindCheckWorkspaceState>;
+    /** 复制到工作区后作为待检文档；会取消正在运行的检查。 */
+    importFile: (filePath: string) => Promise<BlindCheckWorkspaceState>;
+    removeFile: () => Promise<BlindCheckWorkspaceState>;
+    saveUiState: (payload: Partial<Pick<BlindCheckWorkspaceState, 'step' | 'presetTab' | 'resultTab'>>) => Promise<void>;
+    listPresets: () => Promise<BlindCheckPreset[]>;
+    /** 以 basePresetId 为底稿新建我的预设，并设为当前预设。 */
+    createPreset: (payload: { name?: string; basePresetId: string }) => Promise<BlindCheckPreset>;
+    updatePreset: (presetId: string, patch: { name?: string; profile?: BlindCheckProfile }) => Promise<BlindCheckPreset>;
+    deletePreset: (presetId: string) => Promise<BlindCheckPreset[]>;
+    selectPreset: (presetId: string) => Promise<BlindCheckWorkspaceState>;
+    setUseCredentialWords: (enabled: boolean) => Promise<BlindCheckWorkspaceState>;
+    getCredentialWords: () => Promise<BlindCheckCredentialWord[]>;
+    /** 当前文档、预设和敏感词对应的检查输入签名；未选文档时为 null。 */
+    getInputSignature: () => Promise<string | null>;
+    saveFixRules: (rules: string[]) => Promise<BlindCheckWorkspaceState>;
+    saveFixedDocument: () => Promise<CheckResultExportResult>;
+    getTenderSources: () => Promise<BlindCheckTenderSources>;
+    clear: () => Promise<BlindCheckWorkspaceState>;
+  };
   templates: {
     list: () => Promise<ExportTemplateRecord[]>;
     get: (templateId: string) => Promise<ExportTemplateRecord | null>;
@@ -817,12 +884,21 @@ export interface YibiaoBridge {
     startBidAnalysis: (payload: unknown) => Promise<unknown>;
     startOutlineGeneration: (payload: unknown) => Promise<unknown>;
     suppressOutlineSelectionAutoConfirmation: (payload: { taskId: string }) => Promise<{ success: boolean }>;
+    confirmBusinessFillReview: (payload: { taskId: string } & BusinessFillReviewSubmission) => Promise<{ success: boolean }>;
+    suppressBusinessFillReviewAutoConfirmation: (payload: { taskId: string }) => Promise<{ success: boolean }>;
+    startBidTemplateExtraction: () => Promise<unknown>;
+    startRulePageCompile: () => Promise<unknown>;
     startGlobalFactsGeneration: (payload: unknown) => Promise<unknown>;
     startContentGeneration: (payload: unknown) => Promise<unknown>;
     pauseContentGeneration: () => Promise<unknown>;
     startRejectionItemsExtraction: (payload: unknown) => Promise<unknown>;
     startRejectionCheck: (payload: unknown) => Promise<unknown>;
     startDuplicateAnalysis: (payload: unknown) => Promise<unknown>;
+    /** aiReview：仅程序检查（false）或程序检查 + AI 复核（true）。 */
+    startBlindCheck: (payload: { aiReview: boolean }) => Promise<unknown>;
+    /** ai：仅程序修复（false）或程序修复 + AI 修复（true）。 */
+    startBlindCheckFix: (payload: { ai: boolean }) => Promise<unknown>;
+    startBlindCheckPresetExtraction: (payload: { source: 'technical-plan' | 'file'; filePath?: string }) => Promise<unknown>;
     startFeasibilityAnalysis: (payload?: unknown) => Promise<unknown>;
     startFeasibilityOutline: (payload?: unknown) => Promise<unknown>;
     startFeasibilityParameters: (payload?: unknown) => Promise<unknown>;
@@ -835,7 +911,6 @@ export interface YibiaoBridge {
   export: {
     exportWord: (payload: unknown) => Promise<WordExportResult>;
     /** 用户取消正文结构确认时结束该次导出请求。 */
-    cancelWordConfirmation: (requestId: string) => Promise<void>;
     openFile: (filePath: string) => Promise<{ success: boolean }>;
     onWordExportProgress: (callback: (event: WordExportProgressEvent) => void) => () => void;
   };

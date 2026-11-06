@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | Analytics Engine `agnet_analytics` | `ANALYTICS` | 详细事件、今天/7天/30天查询、最近事件、Cron 汇总来源 |
 | D1 `openbidkit-analytics` | `ANALYTICS_DB` | 新版 `stats_*` 长期统计表和全局 IP 封禁状态 |
-| D1 `openbidkit-resources` | `RESOURCE_DB` | 资源管理元数据 |
+| D1 `openbidkit-resources` | `RESOURCE_DB` | 资源管理、公告、更新日志元数据 |
 | R2 `openbidkit` | `RESOURCE_BUCKET` | 资源图片、系统设置图片、插件当前版与上一版安装包 |
 | R2 `openbidkit-agent-errors` | `AGENT_ERROR_BUCKET` | gzip Agent 完整失败诊断包，保留 7 天 |
 | KV | `NOTICE_STORE` | 公告、授权配置、GitHub stats 缓存和模型信息精简索引；旧 IP 封禁列表仅用于一次性迁移 |
@@ -34,7 +34,7 @@
 | `GET/POST/DELETE /api/ip-blocks` | D1 + AE | `ADMIN_TOKEN` | 管理全局精确 IP 封禁；POST 原子写封禁、删除客户端明细并写防回填标记，DELETE 原子解除封禁并释放标记 |
 | `GET/POST /agent-errors` | D1 + R2 | GET 无；POST 有效可信 license | GET 供客户端预检开关、版本和容量；POST 仅在预检条件仍满足时保存 gzip Agent 失败诊断包 |
 | `GET /api/projects` | D1 优先，AE 兜底 | `ADMIN_TOKEN` | 项目列表 |
-| `GET /api/overview` | D1 + AE + KV | `ADMIN_TOKEN` | 概览总数、文本 Token、生图次数、新增、今日活跃、每日统计 |
+| `GET /api/overview` | D1 + AE + KV | `ADMIN_TOKEN` | 概览总数、文本 Token、生图次数、新增、今日活跃、月活、每日统计 |
 | `GET /api/clients` | D1 | `ADMIN_TOKEN` | 客户端统计列表 |
 | `GET /api/client-detail` | AE | `ADMIN_TOKEN` | 单客户端 7天/30天/全部事件明细 |
 | `GET /api/ip-stats` | D1 或 AE | `ADMIN_TOKEN` | `date` 可选；无日期按全部客户端当前最后访问 IP 汇总，指定日期时按当天最后访问 IP 汇总，并返回新客户端数、Total Tokens、AI 服务商和 endpoint host |
@@ -49,8 +49,13 @@
 | `GET /api/retention` | D1 | `ADMIN_TOKEN` | 留存概览，读取 Cron 生成的最新 30 天快照 |
 | `GET /api/github-repo-stats` | GitHub + KV | `ADMIN_TOKEN` | GitHub stats |
 | `GET /notice` | KV | 无 | 客户端公告 |
+| `GET /notices` | `RESOURCE_DB` | 无 | 客户端“公告”按钮列表，只含启用的公告，按更新时间倒序 |
+| `GET /notices/latest` | `RESOURCE_DB` | 无 | 最新启用公告的更新时间，供客户端红点轮询；修改公告也会改变 |
 | `GET /model-info` | KV | 无 | 按 `modelName` 返回最终生效的思考强度、最大 context/output 和缓存时间，人工覆盖优先 |
 | `GET/POST/DELETE /api/notice` | KV | `ADMIN_TOKEN` | 公告后台管理 |
+| `GET /changelogs` | `RESOURCE_DB` | 无 | 客户端更新日志列表，按版本号倒序 |
+| `GET /changelogs/latest` | `RESOURCE_DB` | 无 | 最新一条更新日志的首次发布时间，供客户端红点轮询；修改旧日志不改变 |
+| `GET/POST/DELETE /api/changelogs` | `RESOURCE_DB` | `ADMIN_TOKEN` | 更新日志管理；版本号只接受 `x.y.z`，同项目内唯一 |
 | `GET/POST /api/model-info-cache` | KV + models.dev | `ADMIN_TOKEN` | 分页查看模型详细索引或手动同步，GET 支持 `q/scope/page/pageSize` |
 | `POST/DELETE /api/model-info-cache/override` | KV | `ADMIN_TOKEN` | 保存单条模型人工覆盖，或按 `modelName` 恢复自动同步值 |
 | `POST /license/activate` | KV + Worker Secret | 无 | 客户端免费授权签发，返回带签名 license |
@@ -79,6 +84,7 @@
 | 活跃客户端 | 任意允许事件去重 `client_id` |
 | 总客户端数 | D1 `stats_totals.total_clients` |
 | 今日/7日新增 | D1 `stats_clients.first_seen_date` |
+| 月活 | AE 近 30 天（含今天）任意允许事件去重 `client_id` |
 | 实时客户端入库 | `/track` 只对当前业务日期或前 1 天创建的客户端尝试实时插入并增加总客户端数；授权字段会按客户端授权快照覆盖既有 `stats_clients`；D1 写入失败不影响 `/track` 返回成功；老客户端活跃由 Cron 批量更新 |
 | 最后访问 IP | Worker 优先记录 `CF-Connecting-IP`；如果它是 Pseudo IPv4 的 `240.0.0.0/4` 伪地址，则改用 `CF-Connecting-IPv6`；完全忽略 `CF-Pseudo-IPv4`。AE 写入 `blob13`，D1 `stats_clients.last_access_ip` 由新客户端实时入库和每日 Cron 更新 |
 | 每日统计 | 今天读 AE，前 9 天读 D1 |

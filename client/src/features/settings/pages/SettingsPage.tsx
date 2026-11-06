@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { trackConfigUsage } from '../../../shared/analytics/analytics';
-import { AppSwitch, DetailHelpLink, FloatingToolbar, InlineSpinner, InputWithAction, OfflineLicenseActivationDialog, useAutoAnswer, useToast } from '../../../shared/ui';
+import { AppDialog, AppSwitch, DetailHelpLink, FloatingToolbar, InlineSpinner, InputWithAction, OfflineLicenseActivationDialog, useAutoAnswer, useToast } from '../../../shared/ui';
 import { showUpdateReadyToast } from '../../../shared/updateToast';
 import type { FloatingToolbarGroup } from '../../../shared/ui';
 import type { AgentSelfCheckResult, AgentSelfCheckStepStatus, AiRequestMode, ClientConfig, ComponentsConfig, FileParserProvider, ImageModelConfig, ImageModelProfiles, ImageModelProvider, ImageModelRatio, ImageModelSize, ImageModelStatus, LicenseRuntimeStatus, TextModelConfig, TextModelProfiles, TextModelProvider, UpdateChannel } from '../../../shared/types';
@@ -10,6 +10,7 @@ import OfficialAccountControls from '../components/OfficialAccountControls';
 import OfficialInvoicePanel from '../components/OfficialInvoicePanel';
 import OfficialOrdersPanel from '../components/OfficialOrdersPanel';
 import OfficialTransactionsPanel from '../components/OfficialTransactionsPanel';
+import StorageSpaceDialog from '../components/StorageSpaceDialog';
 
 type UpdateStatus = 'idle' | 'checking' | 'downloading' | 'downloaded' | 'error' | 'disabled';
 type AgentSelfCheckUiStatus = 'untested' | 'checking' | 'normal' | 'busy' | 'error';
@@ -80,16 +81,17 @@ const aiRequestModeOptions: Array<{ value: AiRequestMode; label: string }> = [
 ];
 
 const DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT = 400000;
+const DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT = 128000;
 const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_TEXT_TEMPERATURE = 0.7;
 
 const textProviderDefaults: Record<TextModelProvider, TextModelConfig> = {
-  official: { api_key: '', base_url: 'https://v3.yibiao.pro/qhp-yibiao/anonymous/yibiao/openai/v1', model_name: 'yibiao-text', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
-  jinlong: { api_key: '', base_url: 'https://jlaudeapi.com/v1', model_name: 'gpt-3.5-turbo', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: 0, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
-  volcengine: { api_key: '', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: 0, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
-  deepseek: { api_key: '', base_url: 'https://api.deepseek.com', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: 0, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
-  agnes: { api_key: '', base_url: 'https://apihub.agnes-ai.com/v1', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: 0, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
-  custom: { api_key: '', base_url: '', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: 0, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  official: { api_key: '', base_url: 'https://v3.yibiao.pro/qhp-ai/anonymous/openai/v1', model_name: 'TEXT_GENERATION', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  jinlong: { api_key: '', base_url: 'https://jlaudeapi.com/v1', model_name: 'gpt-3.5-turbo', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  volcengine: { api_key: '', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  deepseek: { api_key: '', base_url: 'https://api.deepseek.com', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  agnes: { api_key: '', base_url: 'https://apihub.agnes-ai.com/v1', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  custom: { api_key: '', base_url: '', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
 };
 
 // 设置页不编辑官方 Key；保存时省略它，由主进程合并磁盘中的最新值。
@@ -121,21 +123,28 @@ function normalizeAiRequestMode(value?: AiRequestMode): AiRequestMode {
   return value === 'normal' ? 'normal' : 'stream';
 }
 
-function normalizeTextContextLengthLimit(value?: number | string): number {
+// 以下归一化的 fallback 传入当前服务商默认值，清空某个服务商的字段不会套用其他服务商的默认值。
+function normalizeTextContextLengthLimit(value?: number | string, fallback = DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT): number {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT;
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }
 
-function normalizeTextConcurrencyLimit(value?: number | string): number {
+// 归一化输出 token 上限，未设置时使用默认值。
+function normalizeTextOutputTokenLimit(value?: number | string, fallback = DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT): number {
   const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.round(number) : DEFAULT_TEXT_CONCURRENCY_LIMIT;
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function normalizeTextConcurrencyLimit(value?: number | string, fallback = DEFAULT_TEXT_CONCURRENCY_LIMIT): number {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : fallback;
 }
 
 // 归一化文本模型温度。
-function normalizeTextTemperature(value?: number | string): number {
-  if (value === '' || value === undefined) return DEFAULT_TEXT_TEMPERATURE;
+function normalizeTextTemperature(value?: number | string, fallback = DEFAULT_TEXT_TEMPERATURE): number {
+  if (value === '' || value === undefined) return fallback;
   const number = Number(value);
-  return Number.isFinite(number) && number >= 0 && number <= 2 ? number : DEFAULT_TEXT_TEMPERATURE;
+  return Number.isFinite(number) && number >= 0 && number <= 2 ? number : fallback;
 }
 
 function parseTextContextLengthInput(value: string): number | '' {
@@ -144,11 +153,11 @@ function parseTextContextLengthInput(value: string): number | '' {
   return Number.isFinite(number) ? Math.max(1, Math.floor(number)) : '';
 }
 
-// 解析输出上限，允许清空或输入非负整数。
+// 解析输出上限，允许清空或输入正整数。
 function parseTextOutputTokenLimitInput(value: string): number | '' {
   if (value === '') return '';
   const number = Number(value);
-  return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : '';
+  return Number.isFinite(number) ? Math.max(1, Math.floor(number)) : '';
 }
 
 function parseTextConcurrencyLimitInput(value: string): number | '' {
@@ -171,11 +180,11 @@ function normalizeTextModelProfile(provider: TextModelProvider, profile?: Partia
     model_name: profile?.model_name ?? defaults.model_name,
     multimodal_enabled: profile?.multimodal_enabled ?? defaults.multimodal_enabled,
     reasoning_effort: profile?.reasoning_effort?.trim() ?? defaults.reasoning_effort,
-    context_length_limit: normalizeTextContextLengthLimit(profile?.context_length_limit ?? defaults.context_length_limit),
-    output_token_limit: profile?.output_token_limit ?? defaults.output_token_limit,
-    concurrency_limit: normalizeTextConcurrencyLimit(profile?.concurrency_limit ?? defaults.concurrency_limit),
+    context_length_limit: normalizeTextContextLengthLimit(profile?.context_length_limit, defaults.context_length_limit),
+    output_token_limit: normalizeTextOutputTokenLimit(profile?.output_token_limit, defaults.output_token_limit),
+    concurrency_limit: normalizeTextConcurrencyLimit(profile?.concurrency_limit, defaults.concurrency_limit),
     temperature_enabled: profile?.temperature_enabled ?? defaults.temperature_enabled,
-    temperature: normalizeTextTemperature(profile?.temperature ?? defaults.temperature),
+    temperature: normalizeTextTemperature(profile?.temperature, defaults.temperature),
     request_mode: normalizeAiRequestMode(profile?.request_mode ?? defaults.request_mode),
   };
 }
@@ -190,17 +199,18 @@ function normalizeTextModelProfiles(
 }
 
 function textProfileFromState(textModel: SettingsPageState['textModel']): TextModelConfig {
+  const defaults = textProviderDefaults[textModel.provider];
   return {
     api_key: textModel.api_key,
-    base_url: textModel.provider === 'custom' ? textModel.base_url : textProviderDefaults[textModel.provider].base_url,
+    base_url: textModel.provider === 'custom' ? textModel.base_url : defaults.base_url,
     model_name: textModel.model_name,
     multimodal_enabled: textModel.multimodal_enabled,
     reasoning_effort: textModel.reasoning_effort.trim(),
-    context_length_limit: normalizeTextContextLengthLimit(textModel.context_length_limit),
-    output_token_limit: Number(textModel.output_token_limit),
-    concurrency_limit: normalizeTextConcurrencyLimit(textModel.concurrency_limit),
+    context_length_limit: normalizeTextContextLengthLimit(textModel.context_length_limit, defaults.context_length_limit),
+    output_token_limit: normalizeTextOutputTokenLimit(textModel.output_token_limit, defaults.output_token_limit),
+    concurrency_limit: normalizeTextConcurrencyLimit(textModel.concurrency_limit, defaults.concurrency_limit),
     temperature_enabled: textModel.temperature_enabled,
-    temperature: normalizeTextTemperature(textModel.temperature),
+    temperature: normalizeTextTemperature(textModel.temperature, defaults.temperature),
     request_mode: textModel.request_mode,
   };
 }
@@ -634,9 +644,11 @@ interface SettingsPageProps {
   onDeveloperModeChange?: (developerMode: boolean) => void;
   request?: SettingsPageRequest | null;
   onRequestHandled?: () => void;
+  registerLeaveGuard?: (guard: ((nextSection?: string) => Promise<boolean>) | null) => void;
 }
 
-function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: SettingsPageProps) {
+// 管理设置草稿，并在离开文本模型设置时提示尚未填写的上下文长度。
+function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, registerLeaveGuard }: SettingsPageProps) {
   const [state, setState] = useState<SettingsPageState>(initialState);
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => request?.tab ?? 'general');
   const [rechargeRequested, setRechargeRequested] = useState(false);
@@ -658,12 +670,44 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
   const [updateError, setUpdateError] = useState('');
   const [licenseStatus, setLicenseStatus] = useState<LicenseRuntimeStatus | null>(null);
   const [offlineLicenseDialogOpen, setOfflineLicenseDialogOpen] = useState(false);
+  const [storageDialogOpen, setStorageDialogOpen] = useState(false);
   const [agentSelfCheckStatus, setAgentSelfCheckStatus] = useState<AgentSelfCheckUiStatus>('untested');
   const [agentSelfCheckResult, setAgentSelfCheckResult] = useState<AgentSelfCheckResult | null>(null);
   const [exportingAgentSelfCheckReport, setExportingAgentSelfCheckReport] = useState(false);
   const [agentAutoAnswerDraft, setAgentAutoAnswerDraft] = useState(false);
+  const [contextLengthDialogOpen, setContextLengthDialogOpen] = useState(false);
+  const contextLengthLeaveResolverRef = useRef<((allowed: boolean) => void) | null>(null);
   const { showToast } = useToast();
   const { enabled: agentAutoAnswerEnabled } = useAutoAnswer();
+
+  // 上下文长度为空时等待用户确认建议，不要求填写或修改配置。
+  const confirmContextLengthLeave = useCallback(async () => {
+    if (activeTab !== 'text-model' || state.textModel.context_length_limit !== '') return true;
+    setContextLengthDialogOpen(true);
+    return new Promise<boolean>((resolve) => {
+      contextLengthLeaveResolverRef.current = resolve;
+    });
+  }, [activeTab, state.textModel.context_length_limit]);
+
+  // 按用户选择继续离开，或取消跳转并留在文本模型设置页。
+  const resolveContextLengthReminder = (allowed: boolean) => {
+    const resolve = contextLengthLeaveResolverRef.current;
+    contextLengthLeaveResolverRef.current = null;
+    setContextLengthDialogOpen(false);
+    resolve?.(allowed);
+  };
+
+  // 切换分类先等待离页确认，重复点击当前分类不提示。
+  const changeSettingsTab = useCallback(async (tab: SettingsTab) => {
+    if (tab === activeTab) return;
+    if (await confirmContextLengthLeave()) setActiveTab(tab);
+  }, [activeTab, confirmContextLengthLeave]);
+
+  // 侧栏页面切换与设置分类切换共用同一确认弹窗。
+  useEffect(() => {
+    registerLeaveGuard?.(confirmContextLengthLeave);
+    return () => registerLeaveGuard?.(null);
+  }, [registerLeaveGuard, confirmContextLengthLeave]);
 
   useEffect(() => {
     void loadTextConfig();
@@ -735,10 +779,10 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
   // 应用级跳转请求只消费一次，之后重新进入设置页或切换分类不会再次触发。
   useEffect(() => {
     if (!request) return;
-    setActiveTab(request.tab);
+    void changeSettingsTab(request.tab);
     if (request.openRecharge) setRechargeRequested(true);
     onRequestHandled?.();
-  }, [request, onRequestHandled]);
+  }, [request, onRequestHandled, changeSettingsTab]);
 
   // 充值只在官方文本模型页打开；已切走或当前不是官方服务商时放弃本次请求。
   useEffect(() => {
@@ -1016,7 +1060,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
     setState((prev) => ({
       ...prev,
       officialApiModelType: modelType,
-      textModel: { ...prev.textModel, model_name: modelType === 'high-quality' ? 'yibiao-reasoning' : 'yibiao-text' },
+      textModel: { ...prev.textModel, model_name: modelType === 'high-quality' ? 'REASONING' : 'TEXT_GENERATION' },
     }));
   };
 
@@ -1346,7 +1390,6 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
       const modelInfo = result.model;
       const efforts = modelInfo.reasoningEfforts || [];
       const updates: Partial<Omit<SettingsPageState['textModel'], 'provider'>> = {
-        output_token_limit: modelInfo.output,
         concurrency_limit: modelInfo.concurrencyLimit,
         request_mode: modelInfo.requestMode,
       };
@@ -1355,6 +1398,9 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
       }
       if (modelInfo.context > 0) {
         updates.context_length_limit = modelInfo.context;
+      }
+      if (modelInfo.output > 0) {
+        updates.output_token_limit = modelInfo.output;
       }
       if (modelInfo.imageInputStatus === 'supported' || modelInfo.imageInputStatus === 'mixed') {
         updates.multimodal_enabled = true;
@@ -1677,7 +1723,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
               key={tab.id}
               type="button"
               className={`settings-tab ${activeTab === tab.id ? 'is-active' : ''}`}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => { void changeSettingsTab(tab.id); }}
               role="tab"
               aria-selected={activeTab === tab.id}
             >
@@ -1742,6 +1788,21 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
               </div>
               <AppSwitch checked={state.general.gpu_hardware_acceleration_enabled} onCheckedChange={(checked) => updateGpuHardwareAcceleration(checked)} />
             </label>
+          </div>
+
+          <div className="settings-group-title">存储</div>
+          <div className="settings-list">
+            <div className="settings-row">
+              <div className="settings-row-copy">
+                <strong>存储空间</strong>
+                <span>查看本机数据占用，清理历史遗留文件以及临时、缓存、日志等文件</span>
+              </div>
+              <div className="settings-action-cell">
+                <button type="button" className="inline-action" onClick={() => setStorageDialogOpen(true)}>
+                  查看与清理
+                </button>
+              </div>
+            </div>
           </div>
 
           <div className="settings-group-title">开发者</div>
@@ -2018,21 +2079,21 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
                     min={1}
                     step={1}
                     value={state.textModel.context_length_limit}
-                    placeholder="400000"
+                    placeholder={String(currentTextProviderDefault.context_length_limit)}
                     onChange={(event) => updateTextModelConfig({ context_length_limit: parseTextContextLengthInput(event.target.value) })}
                   />
                 </label>
                 <label className="settings-row">
                   <div className="settings-row-copy">
                     <strong>输出token上限</strong>
-                    <span>留空或设为 0 时不限制输出 token 数</span>
+                    <span>可手动录入或自动填充；留空时使用默认值 {currentTextProviderDefault.output_token_limit}</span>
                   </div>
                   <input
                     type="number"
-                    min={0}
+                    min={1}
                     step={1}
                     value={state.textModel.output_token_limit}
-                    placeholder="0"
+                    placeholder={String(currentTextProviderDefault.output_token_limit)}
                     onChange={(event) => updateTextModelConfig({ output_token_limit: parseTextOutputTokenLimitInput(event.target.value) })}
                   />
                 </label>
@@ -2046,7 +2107,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
                     min={1}
                     step={1}
                     value={state.textModel.concurrency_limit}
-                    placeholder="10"
+                    placeholder={String(currentTextProviderDefault.concurrency_limit)}
                     onChange={(event) => updateTextModelConfig({ concurrency_limit: parseTextConcurrencyLimitInput(event.target.value) })}
                   />
                 </label>
@@ -2639,11 +2700,28 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled }: Sett
         </section>
       )}
       </div>
+      <AppDialog
+        open={contextLengthDialogOpen}
+        title="上下文长度设置提醒"
+        description={<>建议设置文本模型的<strong>上下文长度限制</strong>；如果不清楚如何设置，可点击“<strong>自动填充高级参数</strong>”。</>}
+        preventClose
+        actions={
+          <>
+            <button type="button" className="secondary-action" onClick={() => resolveContextLengthReminder(true)}>
+              继续离开
+            </button>
+            <button type="button" className="primary-action" onClick={() => resolveContextLengthReminder(false)}>
+              前往设置
+            </button>
+          </>
+        }
+      />
       <OfflineLicenseActivationDialog
         open={offlineLicenseDialogOpen}
         onOpenChange={setOfflineLicenseDialogOpen}
         onActivated={setLicenseStatus}
       />
+      {storageDialogOpen && <StorageSpaceDialog onClose={() => setStorageDialogOpen(false)} />}
       <FloatingToolbar groups={settingsToolbarGroups} label="设置保存工具条" />
     </div>
   );

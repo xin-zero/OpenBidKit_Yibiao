@@ -451,6 +451,10 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+.overview-usage-cards {
+  grid-template-columns: repeat(6, 1fr);
+}
+
 .card {
   padding: 14px 16px;
 }
@@ -983,6 +987,16 @@ button:disabled {
   width: 120px;
 }
 
+.changelog-filter {
+  width: 180px;
+}
+
+.changelog-summary-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .notice-form {
   display: grid;
   grid-template-columns: 1fr 220px;
@@ -1056,6 +1070,22 @@ button:disabled {
   border: 0;
   border-radius: 0;
   box-shadow: none;
+}
+
+/* 媒体配置沿用公告编辑面板，隐藏字段不占布局空间。 */
+.notice-media-fields {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.notice-media-fields small {
+  color: var(--muted);
+}
+
+#noticeMediaFields[hidden],
+#noticeContent[hidden] {
+  display: none;
 }
 
 #noticeContent:focus {
@@ -1143,7 +1173,8 @@ button:disabled {
   color: var(--primary);
 }
 
-.notice-preview-content img {
+.notice-preview-content img,
+.notice-preview-content video {
   display: block;
   max-width: 100%;
   max-height: 260px;
