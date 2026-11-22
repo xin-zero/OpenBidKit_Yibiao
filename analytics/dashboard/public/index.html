@@ -27,6 +27,7 @@
           <button class="nav-item" type="button" data-tab-button="traffic">访问分析</button>
           <button class="nav-item" type="button" data-tab-button="config">配置使用</button>
           <button class="nav-item" type="button" data-tab-button="models">模型使用</button>
+          <button class="nav-item" type="button" data-tab-button="model-trend">模型趋势</button>
           <button class="nav-item" type="button" data-tab-button="agent">Agent 分析</button>
           <button class="nav-item" type="button" data-tab-button="latest">最近事件</button>
         </div>
@@ -38,7 +39,9 @@
           <button class="nav-item" type="button" data-tab-button="changelog">更新日志</button>
           <button class="nav-item" type="button" data-tab-button="license">授权管理</button>
           <button class="nav-item" type="button" data-tab-button="resources">资源管理</button>
+          <button class="nav-item" type="button" data-tab-button="ads">广告管理</button>
           <button class="nav-item" type="button" data-tab-button="plugins">插件管理</button>
+          <button class="nav-item" type="button" data-tab-button="dependencies">依赖管理</button>
           <button class="nav-item" type="button" data-tab-button="model-info-cache">模型信息缓存</button>
         </div>
       </nav>
@@ -259,11 +262,15 @@
 
         <!-- 模型使用 -->
         <section id="tab-models" class="tab-panel" data-tab-panel="models">
+          <section class="cards model-usage-cards">
+            <div class="panel card"><span>文本模型 Token 总数</span><strong id="modelTextTokens">0</strong></div>
+            <div class="panel card"><span>生图模型总次数</span><strong id="modelImageRequests">0</strong></div>
+          </section>
           <section class="panel section">
             <div class="section-head">
               <div>
                 <h2>模型使用</h2>
-                <p>历史总数展示累计请求次数。</p>
+                <p>顶部汇总随范围联动、不随筛选变化；历史总数展示累计请求次数。</p>
               </div>
               <label class="inline-select">
                 范围
@@ -293,6 +300,27 @@
               </label>
             </div>
             <div id="modelUsage"></div>
+          </section>
+        </section>
+
+        <!-- 模型趋势 -->
+        <section id="tab-model-trend" class="tab-panel" data-tab-panel="model-trend">
+          <section class="panel section">
+            <div class="section-head">
+              <div>
+                <h2>模型趋势</h2>
+                <p>每日文本 Token 总量与按域名聚合的 Top 10 服务用量，仅统计已汇总的完整天（不含今天）。</p>
+              </div>
+              <label class="inline-select">
+                范围
+                <select id="modelTrendRange">
+                  <option value="7">7 天</option>
+                  <option value="30" selected>30 天</option>
+                  <option value="90">90 天</option>
+                </select>
+              </label>
+            </div>
+            <div id="modelTrendChart"></div>
           </section>
         </section>
 
@@ -755,6 +783,55 @@
           </section>
         </section>
 
+        <!-- 广告管理 -->
+        <section id="tab-ads" class="tab-panel" data-tab-panel="ads">
+          <section class="panel section resource-panel">
+            <div class="section-head">
+              <div>
+                <h2>广告管理</h2>
+                <p>配置客户端侧边栏轮播广告，每条包含一张图片和一个跳转链接。客户端固定显示 250×120，建议上传 2:1 比例图片。</p>
+              </div>
+              <div class="resource-head-actions">
+                <button id="loadAdsButton" type="button">读取广告</button>
+                <button id="newAdButton" type="button">新增广告</button>
+              </div>
+            </div>
+
+            <form id="adForm" class="resource-form">
+              <input id="adId" type="hidden" />
+              <div class="resource-image-editor">
+                <span>图片</span>
+                <div id="adImagePreview" class="resource-image-preview">无图片</div>
+                <input id="adImage" type="file" accept="image/png,image/jpeg,image/webp,image/gif" />
+              </div>
+
+              <label class="resource-field-wide">
+                跳转链接
+                <input id="adLinkUrl" maxlength="500" placeholder="https://…" />
+              </label>
+              <label>
+                状态
+                <select id="adEnabled">
+                  <option value="true" selected>启用</option>
+                  <option value="false">停用</option>
+                </select>
+              </label>
+              <label>
+                排序
+                <input id="adSortOrder" type="number" value="1" />
+              </label>
+
+              <div class="resource-actions">
+                <button id="resetAdButton" class="secondary-button" type="button">清空表单</button>
+                <button id="saveAdButton" type="submit">保存广告</button>
+              </div>
+            </form>
+
+            <div id="adsStatus" class="notice-status"></div>
+            <div id="adsTable" class="resource-table-wrap"></div>
+          </section>
+        </section>
+
         <!-- 插件管理 -->
         <section id="tab-plugins" class="tab-panel" data-tab-panel="plugins">
           <section class="panel section">
@@ -794,6 +871,66 @@
 
             <div id="pluginsStatus" class="notice-status"></div>
             <div id="pluginsTable" class="plugin-table-wrap"></div>
+          </section>
+        </section>
+
+        <!-- 依赖管理 -->
+        <section id="tab-dependencies" class="tab-panel" data-tab-panel="dependencies">
+          <section class="panel section">
+            <div class="section-head">
+              <div>
+                <h2>依赖管理</h2>
+                <p>客户端按需下载的功能组件。安装包请上传到 R2 的 dependencies/ 目录，不要放在 plugins/ 下（会被插件同步清理）。</p>
+              </div>
+            </div>
+
+            <form id="dependencyForm" class="plugin-form" autocomplete="off">
+              <label>
+                依赖 ID *
+                <input id="dependencyId" maxlength="80" placeholder="例如：ocr-v1" required />
+              </label>
+              <label>
+                适用平台
+                <select id="dependencyPlatform">
+                  <option value="all" selected>通用</option>
+                  <option value="win32-x64">Windows x64</option>
+                  <option value="darwin-x64">macOS Intel</option>
+                  <option value="darwin-arm64">macOS Apple 芯片</option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select id="dependencyEnabled">
+                  <option value="true" selected>启用</option>
+                  <option value="false">停用</option>
+                </select>
+              </label>
+              <label>
+                名称 *
+                <input id="dependencyName" maxlength="120" placeholder="例如：文字识别组件" required />
+              </label>
+              <label>
+                版本 *
+                <input id="dependencyVersion" maxlength="40" placeholder="例如：1.0.0" required />
+              </label>
+              <label class="plugin-field-wide">
+                说明
+                <input id="dependencyDescription" maxlength="500" placeholder="客户端询问是否下载时显示" />
+              </label>
+              <label class="plugin-field-wide">
+                下载链接 *
+                <input id="dependencyDownloadUrl" maxlength="500" placeholder="例如：https://openbidkit-oss.agnet.top/dependencies/ocr-v1/ocr-v1-1.0.0.zip" required />
+                <small>保存时自动读取文件大小；同一依赖 ID 和平台只保留一条，再次保存即更新。</small>
+              </label>
+
+              <div class="plugin-actions">
+                <button id="resetDependencyButton" class="secondary-button" type="button">清空表单</button>
+                <button id="saveDependencyButton" type="submit">保存</button>
+              </div>
+            </form>
+
+            <div id="dependenciesStatus" class="notice-status"></div>
+            <div id="dependenciesTable" class="plugin-table-wrap"></div>
           </section>
         </section>
 

@@ -11,6 +11,7 @@ import type { CredentialCertificate, CredentialEmployee, CredentialImageFieldKey
 import type { ExportFormatConfig, ExportTemplateRecord } from './exportFormat';
 import type { TechnicalPlanOutlineData as OutlineData } from './outline';
 import type { NoticeCachedMedia, NoticeMediaCacheRequest } from './notice';
+import type { DualLayerPdfEnvironment, DualLayerPdfOutputs, DualLayerPdfState } from '../../features/dual-layer-pdf/types';
 
 /** 配置保存只更新提交字段，文本服务商档案也支持局部更新。 */
 export type ClientConfigPatch = Partial<Omit<ClientConfig, 'text_model_profiles'>> & {
@@ -64,6 +65,8 @@ export interface WordExportResult {
   path?: string;
   message?: string;
   warnings?: string[];
+  /** 投标文件导出失败且尚未启用 AI 调整时的失败现场 ID，确认启用后据此修复。 */
+  adjustment_failure_id?: string;
 }
 
 export interface CheckResultExportResult {
@@ -606,6 +609,28 @@ export interface DeveloperLayoutFigureResult {
   elapsedMs: number;
 }
 
+/** 按需下载的功能组件的安装进度。 */
+export interface DependencyProgress {
+  id: string;
+  phase: 'downloading' | 'extracting' | 'done' | 'error';
+  percent: number;
+  message?: string;
+}
+
+/** 按需下载的功能组件（如文字识别运行库和模型）的状态。 */
+export interface DependencyStatus {
+  id: string;
+  installed: boolean;
+  installedVersion: string;
+  /** 线上登记的安装包；读取失败或没有适用于当前系统的安装包时为 null。 */
+  available: { name: string; description: string; version: string; size: number; platform: string } | null;
+  hasUpdate: boolean;
+  installing: boolean;
+  progress: DependencyProgress | null;
+  /** 线上信息读取失败的原因。 */
+  message: string;
+}
+
 export interface YibiaoBridge {
   appName: string;
   platform: string;
@@ -750,7 +775,7 @@ export interface YibiaoBridge {
     deleteFolder: (folderId: string) => Promise<KnowledgeBaseMutationResult>;
     deleteDocument: (documentId: string) => Promise<KnowledgeBaseMutationResult>;
     moveDocument: (documentId: string, targetFolderId: string, targetDocumentId?: string | null, position?: 'before' | 'after') => Promise<KnowledgeBaseIndexMutationResult>;
-    uploadDocuments: (folderId: string) => Promise<KnowledgeBaseUploadResult>;
+    uploadDocuments: (folderId: string, filePaths?: string[]) => Promise<KnowledgeBaseUploadResult>;
     retryDocument: (documentId: string) => Promise<KnowledgeBaseRetryDocumentResult>;
     startMatching: (documentId: string, batchSize?: number) => Promise<KnowledgeBaseStartMatchingResult>;
     readMarkdown: (documentId: string) => Promise<string>;
@@ -774,6 +799,8 @@ export interface YibiaoBridge {
     deleteOtherMaterial: (recordId: string) => Promise<CredentialLibraryMutationResult>;
   };
   technicalPlan: {
+    activateAdjustment: () => Promise<{ success: boolean }>;
+    enableDocumentAdjustment: (payload?: { exportFailureId?: string }) => Promise<TechnicalPlanState>;
     loadState: () => Promise<TechnicalPlanState>;
     loadGenerationConfig: () => Promise<TechnicalPlanGenerationConfig>;
     saveGenerationConfig: (partial: Partial<TechnicalPlanGenerationConfig>) => Promise<TechnicalPlanGenerationConfig>;
@@ -890,6 +917,7 @@ export interface YibiaoBridge {
     startRulePageCompile: () => Promise<unknown>;
     startGlobalFactsGeneration: (payload: unknown) => Promise<unknown>;
     startContentGeneration: (payload: unknown) => Promise<unknown>;
+    startBidDocumentAdjustment: (payload: { requirement: string } | { sectionIds: string[]; requirement?: string } | { resume: true }) => Promise<unknown>;
     pauseContentGeneration: () => Promise<unknown>;
     startRejectionItemsExtraction: (payload: unknown) => Promise<unknown>;
     startRejectionCheck: (payload: unknown) => Promise<unknown>;
@@ -931,6 +959,28 @@ export interface YibiaoBridge {
     refreshMarket: () => Promise<void>;
     clearUpdateFailedState: (pluginId: string) => Promise<boolean>;
     notifyEvent: (pluginId: string, event: string, payload?: unknown) => Promise<void>;
+  };
+  dependencies: {
+    getStatus: (dependencyId: string) => Promise<DependencyStatus>;
+    install: (dependencyId: string) => Promise<DependencyStatus>;
+    uninstall: (dependencyId: string) => Promise<DependencyStatus>;
+    onProgress: (callback: (progress: DependencyProgress) => void) => () => void;
+  };
+  dualLayerPdf: {
+    getState: () => Promise<DualLayerPdfState>;
+    getEnvironment: () => Promise<DualLayerPdfEnvironment>;
+    selectFiles: () => Promise<DualLayerPdfState>;
+    addFiles: (filePaths: string[]) => Promise<DualLayerPdfState>;
+    removeItem: (itemId: string) => Promise<DualLayerPdfState>;
+    retryItem: (itemId: string) => Promise<DualLayerPdfState>;
+    selectOutputDir: () => Promise<DualLayerPdfState>;
+    resetOutputDir: () => Promise<DualLayerPdfState>;
+    setOutputs: (outputs: DualLayerPdfOutputs) => Promise<DualLayerPdfState>;
+    start: () => Promise<DualLayerPdfState>;
+    cancel: () => Promise<DualLayerPdfState>;
+    clear: () => Promise<DualLayerPdfState>;
+    showInFolder: (filePath: string) => Promise<void>;
+    onEvent: (callback: (state: DualLayerPdfState) => void) => () => void;
   };
 }
 

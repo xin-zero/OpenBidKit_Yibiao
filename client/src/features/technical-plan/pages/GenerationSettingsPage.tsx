@@ -11,6 +11,10 @@ import { IMAGE_LAYOUTS, getDefaultImageLayoutShares, resolveImageLayoutShares, t
 import aiImageExampleUrl from '../../../../assets/generate_img_example/ai.png';
 import mermaidImageExampleUrl from '../../../../assets/generate_img_example/mermaid.png';
 import htmlImageExampleUrl from '../../../../assets/generate_img_example/html.png';
+import singleLayoutExampleUrl from '../../../../assets/generate_img_example/layout-single.webp';
+import imageTextLayoutExampleUrl from '../../../../assets/generate_img_example/layout-image-text.webp';
+import threeImagesLayoutExampleUrl from '../../../../assets/generate_img_example/layout-three-images.webp';
+import fourImagesLayoutExampleUrl from '../../../../assets/generate_img_example/layout-four-images.webp';
 
 interface GenerationSettingsPageProps {
   activeTab: GenerationSettingsTab;
@@ -125,11 +129,11 @@ const imageModelStatusLabels: Record<ImageModelStatus, string> = {
   available: '可用',
   unavailable: '不可用',
 };
-const imageLayoutLabels: Record<ImageLayoutKey, string> = {
-  single: '单张图片',
-  imageText: '图片表格',
-  threeImages: '三列图片',
-  fourImages: '四宫格',
+const imageLayoutExamples: Record<ImageLayoutKey, { label: string; src: string }> = {
+  single: { label: '单张图片', src: singleLayoutExampleUrl },
+  imageText: { label: '图片表格', src: imageTextLayoutExampleUrl },
+  threeImages: { label: '三列图片', src: threeImagesLayoutExampleUrl },
+  fourImages: { label: '四宫格', src: fourImagesLayoutExampleUrl },
 };
 const imageGenerationExamples: Record<ContentIllustrationKind, { src: string; alt: string }> = {
   ai: { src: aiImageExampleUrl, alt: 'AI 生图示例' },
@@ -273,6 +277,7 @@ function GenerationSettingsPage({
   const [knowledgeSaving, setKnowledgeSaving] = useState(false);
   const [globalFactsModeBusy, setGlobalFactsModeBusy] = useState(false);
   const [exportTemplateBusy, setExportTemplateBusy] = useState(false);
+  const [defaultExportTemplateId, setDefaultExportTemplateId] = useState<string>();
   const [exportTemplateScopeBusy, setExportTemplateScopeBusy] = useState(false);
   const [imageModelStatus, setImageModelStatus] = useState<ImageModelStatus>('untested');
   const [draftTableRequirement, setDraftTableRequirement] = useState<ContentTableRequirement>(() => (
@@ -312,6 +317,7 @@ function GenerationSettingsPage({
   const imageLayoutShares = resolveImageLayoutShares(draftIllustrationOptions);
   const enabledImageLayoutCount = IMAGE_LAYOUTS.filter(({ key }) => imageLayoutShares[key] > 0).length;
   const selectedExportTemplate = exportTemplates.find((template) => template.template_id === exportTemplateId) || null;
+  const selectedExportTemplateIsDefault = selectedExportTemplate !== null && exportTemplateId === defaultExportTemplateId;
   // 页签第二行“功能词·当前值”只读取已保存配置，输入中的草稿不提前展示。
   const tabSummaries: Record<GenerationSettingsTab, string> = {
     content: `范围·${outlineModeSummaryLabels[outlineMode]}`,
@@ -336,8 +342,11 @@ function GenerationSettingsPage({
   useEffect(() => {
     let cancelled = false;
     window.yibiao?.config.load().then((config) => {
-      if (!cancelled) setImageModelStatus(config.image_model?.status || 'untested');
-    }).catch((error) => console.warn('读取生图模型状态失败', error));
+      if (!cancelled) {
+        setImageModelStatus(config.image_model?.status || 'untested');
+        setDefaultExportTemplateId(config.technical_plan_default_export_template_id);
+      }
+    }).catch((error) => console.warn('读取用户配置失败', error));
     return () => { cancelled = true; };
   }, []);
 
@@ -355,12 +364,12 @@ function GenerationSettingsPage({
     document.getElementById(`generation-settings-tab-${activeTab}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [activeTab]);
 
+  // 只在进入知识库页签时加载索引；勾选保存后保留搜索和展开状态。
   useEffect(() => {
     if (activeTab !== 'knowledge') return;
-    setDraftKnowledgeDocumentIds(referenceKnowledgeDocumentIds);
     setKnowledgeSearch('');
     void loadKnowledgeIndex();
-  }, [activeTab, referenceKnowledgeDocumentIds]);
+  }, [activeTab]);
 
   const resolveDroppedFilePaths = (files: FileList) =>
     Array.from(files).map((file) => window.yibiao?.file.getPathForFile(file) || '').filter(Boolean);
@@ -562,6 +571,20 @@ function GenerationSettingsPage({
       showToast('保存成功', 'success');
     } catch (error) {
       showToast(error instanceof Error ? error.message : '保存导出模板失败', 'error');
+    } finally {
+      setExportTemplateBusy(false);
+    }
+  };
+
+  // 默认模板只影响后续投标，不写入当前项目配置。
+  const saveDefaultExportTemplate = async (templateId: string) => {
+    setExportTemplateBusy(true);
+    try {
+      await window.yibiao!.config.save({ technical_plan_default_export_template_id: templateId });
+      setDefaultExportTemplateId(templateId);
+      showToast('已设为默认模板', 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '设置默认模板失败', 'error');
     } finally {
       setExportTemplateBusy(false);
     }
@@ -1047,13 +1070,30 @@ function GenerationSettingsPage({
                     <small>参与配图的小节按以下占比分配布局；关闭某类布局后，其占比均分给其他开启的布局。</small>
                   </div>
                   {IMAGE_LAYOUTS.map(({ key, optionKey }) => {
+                    const { label, src } = imageLayoutExamples[key];
+                    const exampleTitle = `${label}示例`;
+                    const exampleAction = `查看${exampleTitle}`;
                     const checked = imageLayoutShares[key] > 0;
                     const available = defaultImageLayoutShares[key] > 0;
                     const isLastEnabled = checked && enabledImageLayoutCount === 1;
                     const hint = !available ? '当前配图比例下不使用' : isLastEnabled ? '至少保留一种布局' : '';
                     return (
                       <div className="content-generation-config-row" key={key}>
-                        <span><strong>{imageLayoutLabels[key]}</strong>{hint && <small>{hint}</small>}</span>
+                        <div>
+                          <div className="content-generation-image-option-title">
+                            <strong>{label}</strong>
+                            <button
+                              type="button"
+                              className="content-generation-example-button"
+                              onClick={() => setPreviewImage({ src, alt: exampleTitle })}
+                              aria-label={exampleAction}
+                              title={exampleAction}
+                            >
+                              <ImageExampleIcon />
+                            </button>
+                          </div>
+                          {hint && <small>{hint}</small>}
+                        </div>
                         <div className="content-generation-config-control">
                           <em className="content-image-layout-share">{imageLayoutShares[key]}%</em>
                           <AppSwitch
@@ -1064,7 +1104,7 @@ function GenerationSettingsPage({
                               tableRequirement: draftTableRequirement,
                               [optionKey]: nextChecked,
                             })}
-                            aria-label={`是否使用${imageLayoutLabels[key]}布局`}
+                            aria-label={`是否使用${label}布局`}
                           />
                         </div>
                       </div>
@@ -1181,14 +1221,40 @@ function GenerationSettingsPage({
                 </div>
                 <div className="generation-settings-export-template-control">
                   <select
+                    className="generation-settings-export-template-select"
                     value={selectedExportTemplate?.template_id || ''}
                     disabled={exportTemplatesLoading || exportTemplateBusy || !exportTemplates.length}
                     onChange={(event) => void saveExportTemplate(event.target.value)}
                     aria-label="导出模板选择"
+                    aria-describedby={selectedExportTemplateIsDefault ? 'generation-settings-default-template-badge' : undefined}
                   >
                     <option value="" disabled>{exportTemplatesLoading ? '正在读取模板...' : '请选择导出模板'}</option>
-                    {exportTemplates.map((template) => <option value={template.template_id} key={template.template_id}>{template.template_name}</option>)}
+                    {exportTemplates.map((template) => {
+                      const isDefault = template.template_id === defaultExportTemplateId;
+                      return (
+                        <option
+                          key={template.template_id}
+                          value={template.template_id}
+                          className={isDefault ? 'template-default-option' : undefined}
+                          aria-label={isDefault ? `${template.template_name}（默认）` : undefined}
+                        >
+                          {template.template_name}
+                        </option>
+                      );
+                    })}
                   </select>
+                  {selectedExportTemplateIsDefault ? (
+                    <span id="generation-settings-default-template-badge" className="template-default-badge">默认</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      disabled={exportTemplatesLoading || exportTemplateBusy || !selectedExportTemplate}
+                      onClick={() => void saveDefaultExportTemplate(exportTemplateId)}
+                    >
+                      设为默认
+                    </button>
+                  )}
                   {onCreateExportTemplate && <button type="button" className="secondary-action" onClick={onCreateExportTemplate}>新建模板</button>}
                 </div>
                 {!exportTemplatesLoading && !exportTemplates.length && <p className="generation-settings-export-template-status">暂无可用模板，请先新建并保存 Word 导出模板。</p>}

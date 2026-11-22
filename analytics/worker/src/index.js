@@ -1,9 +1,10 @@
 import { corsHeaders, json } from './http.js';
+import { handleAdminAds, handlePublicAds } from './routes/ads.js';
 import { handleAgentRuntime } from './routes/agentRuntime.js';
 import { handleAdminChangelogs, handlePublicChangelogLatest, handlePublicChangelogs } from './routes/changelog.js';
 import { handleAdminAgentErrorConfig, handleAdminAgentErrorDownload, handleAdminAgentErrors, handleAgentErrorIngest } from './routes/agentErrors.js';
 import { handleClients, handleClientDetail, handleIpStats } from './routes/clients.js';
-import { handleConfigUsage, handleModelUsage } from './routes/configUsage.js';
+import { handleConfigUsage, handleModelTrend, handleModelUsage } from './routes/configUsage.js';
 import { handleGitHubRepoStats } from './routes/githubRepoStats.js';
 import { handleHealth } from './routes/health.js';
 import { handleAdminIpBlocks, handlePublicIpBlocks } from './routes/ipBlocks.js';
@@ -17,6 +18,7 @@ import { handleProjects } from './routes/projects.js';
 import { handleRetention } from './routes/retention.js';
 import { handleAdminResources, handlePublicResources, handleResourceImage } from './routes/resources.js';
 import { handleAdminPluginSync, handleAdminPlugins, handlePublicPluginDownload, handlePublicPlugins } from './routes/plugins.js';
+import { handleAdminDependencies, handlePublicDependencies, handlePublicDependencyDownload } from './routes/dependencies.js';
 import { handleAdminSystemSettings, handlePublicSystemSettings } from './routes/systemSettings.js';
 import { handleTrack } from './routes/track.js';
 import { handleTraffic } from './routes/traffic.js';
@@ -46,8 +48,11 @@ const routes = new Map([
   ['/resources', handlePublicResources],
   ['/resource-image', handleResourceImage],
   ['/system-settings', handlePublicSystemSettings],
+  ['/ads', handlePublicAds],
   ['/plugins', handlePublicPlugins],
   ['/plugins/download', handlePublicPluginDownload],
+  ['/dependencies', handlePublicDependencies],
+  ['/dependencies/download', handlePublicDependencyDownload],
   ['/api/projects', handleProjects],
   ['/api/notice', handleAdminNotice],
   ['/api/changelogs', handleAdminChangelogs],
@@ -56,7 +61,9 @@ const routes = new Map([
   ['/api/resources', handleAdminResources],
   ['/api/plugins', handleAdminPlugins],
   ['/api/plugins/sync', handleAdminPluginSync],
+  ['/api/dependencies', handleAdminDependencies],
   ['/api/system-settings', handleAdminSystemSettings],
+  ['/api/ads', handleAdminAds],
   ['/api/overview', handleOverview],
   ['/api/clients', handleClients],
   ['/api/client-detail', handleClientDetail],
@@ -68,6 +75,7 @@ const routes = new Map([
   ['/api/retention', handleRetention],
   ['/api/config-usage', handleConfigUsage],
   ['/api/model-usage', handleModelUsage],
+  ['/api/model-trend', handleModelTrend],
   ['/api/agent-runtime', handleAgentRuntime],
   ['/api/agent-errors/config', handleAdminAgentErrorConfig],
   ['/api/agent-errors/download', handleAdminAgentErrorDownload],

@@ -330,6 +330,26 @@
   box-shadow: var(--yb-focus-ring);
 }
 
+.generation-settings-export-template-select {
+  appearance: base-select;
+  align-items: center;
+}
+
+.generation-settings-export-template-select::picker(select) {
+  appearance: base-select;
+  padding: 4px;
+  background: var(--yb-surface);
+  border: 1px solid var(--yb-border);
+  border-radius: var(--yb-radius-md);
+  box-shadow: var(--yb-shadow-sm);
+}
+
+.generation-settings-export-template-select option {
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: var(--yb-radius-sm);
+}
+
 .generation-settings-export-template-status {
   margin: 0;
   color: var(--yb-text-soft);
@@ -3922,13 +3942,21 @@
   opacity: 0.68;
 }
 
+/* 左侧待选、右侧已选，两栏各自滚动，窗口较矮时待选列表不会被已选区挤掉。 */
 .outline-knowledge-grid {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(90px, 180px);
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 34%);
   gap: 10px;
   height: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+@media (max-width: 720px) {
+  .outline-knowledge-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(90px, 180px);
+  }
 }
 
 .outline-knowledge-browser,

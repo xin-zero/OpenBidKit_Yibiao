@@ -25,6 +25,8 @@ interface OutlineEditPageProps {
   task?: BackgroundTaskState;
   contentTaskStatus?: BackgroundTaskState['status'];
   aiAdjustmentRunning?: boolean;
+  /** 已启用投标文件 AI 调整：只允许排序，其余目录修改通过 AI 调整完成。 */
+  documentAdjustmentEnabled?: boolean;
   templateExtractionTask?: BackgroundTaskState;
   /** 正文页单独“重新编制”规则和页码的任务；运行时锁定目录，避免清掉正在编制的结果。 */
   rulePageCompileTask?: BackgroundTaskState;
@@ -225,6 +227,7 @@ function OutlineEditPage({
   task,
   contentTaskStatus,
   aiAdjustmentRunning = false,
+  documentAdjustmentEnabled = false,
   templateExtractionTask,
   rulePageCompileTask,
   onOutlineSaved,
@@ -253,6 +256,7 @@ function OutlineEditPage({
   const logListRef = useRef<HTMLDivElement | null>(null);
   const shownTaskErrorIdRef = useRef<string | null>(null);
   const runningExtractionIdRef = useRef<string | null>(null);
+  const runningOutlineIdRef = useRef<string | null>(null);
   const { showToast } = useToast();
   const activeOutlineData = sorting ? draftOutlineData : outlineData;
   const selectedItem = activeOutlineData && selectedItemId ? findOutlineItem(activeOutlineData.outline, selectedItemId) : null;
@@ -268,7 +272,9 @@ function OutlineEditPage({
   const panelBusy = generating || templateExtracting;
   const contentMutationLocked = contentTaskStatus === 'running' || contentTaskStatus === 'pausing' || contentTaskStatus === 'paused';
   const rulePageCompiling = ['running', 'pausing', 'paused'].includes(rulePageCompileTask?.status || '');
-  const outlineMutationLocked = generating || templateExtracting || contentMutationLocked || rulePageCompiling || savingSort || aiAdjustmentRunning;
+  // 排序只改变顺序和编号，启用 AI 调整后仍可使用；新增、编辑、删除另受启用状态锁定。
+  const outlineSortLocked = generating || templateExtracting || contentMutationLocked || rulePageCompiling || savingSort || aiAdjustmentRunning;
+  const outlineMutationLocked = outlineSortLocked || documentAdjustmentEnabled;
   const progressLogs = progressTask?.logs || [];
   const latestLog = progressLogs[progressLogs.length - 1];
   const progress = panelBusy
@@ -339,6 +345,22 @@ function OutlineEditPage({
     showToast(task.error || '目录生成失败，请调整设置后重新生成目录', 'error');
   }, [showToast, task?.error, task?.status, task?.task_id]);
 
+  // 目录生成成功但并行的投标模版提取失败时提示一次；只提示本页面看到运行过的任务，重新进入页面不重复提示。
+  useEffect(() => {
+    const taskId = task?.task_id;
+    if (!taskId) return;
+    if (task?.status === 'running') {
+      runningOutlineIdRef.current = taskId;
+      return;
+    }
+    if (runningOutlineIdRef.current !== taskId) return;
+    runningOutlineIdRef.current = null;
+    const templateAgent = task?.stats?.template_agent;
+    if (task?.status === 'success' && templateAgent?.status === 'error') {
+      showToast(`目录已生成，但投标模版提取失败：${templateAgent.error || '未知原因'}。请点击“下一步”重新提取投标模版`, 'error');
+    }
+  }, [showToast, task?.status, task?.task_id, task?.stats?.template_agent]);
+
   // 只提示本页面看到运行过的提取任务结果，重新进入页面不重复提示。
   useEffect(() => {
     const taskId = templateExtractionTask?.task_id;
@@ -380,7 +402,7 @@ function OutlineEditPage({
   }, [progressLogs.length]);
 
   const generateOutline = async (noTechnicalScoreMode = false) => {
-    const lockMessage = getMutationLockMessage();
+    const lockMessage = getMutationLockMessage(false);
     if (lockMessage) {
       throw new Error(lockMessage);
     }
@@ -403,13 +425,7 @@ function OutlineEditPage({
       setLocalStartAt(startedNow);
       setNowTick(startedNow);
       const nextOutlineExpansionMode = hasOriginalPlan ? outlineExpansionMode : 'ai-complement';
-      await window.yibiao?.tasks.startOutlineGeneration({
-        reference_knowledge_document_ids: referenceKnowledgeDocumentIds,
-        outline_mode: outlineMode,
-        outline_expansion_mode: nextOutlineExpansionMode,
-        word_control_options: outlineWordControlOptions,
-        no_technical_score_mode: noTechnicalScoreMode,
-      });
+      await window.yibiao?.tasks.startOutlineGeneration({ no_technical_score_mode: noTechnicalScoreMode });
       trackConfigUsage({
         outline_mode: outlineMode,
         outline_expansion_mode: hasOriginalPlan ? nextOutlineExpansionMode : undefined,
@@ -446,11 +462,13 @@ function OutlineEditPage({
     void window.yibiao.tasks.suppressOutlineSelectionAutoConfirmation({ taskId: task.task_id }).catch(() => undefined);
   };
 
-  const getMutationLockMessage = () => {
+  // 重新生成目录（清空正文并退出 AI 调整）和排序不受 AI 调整启用状态限制。
+  const getMutationLockMessage = (includeDocumentAdjustment = true) => {
     if (generating) return '目录生成任务正在运行，当前目录暂不可编辑';
     if (templateExtracting) return '投标模版正在重新提取，当前目录暂不可编辑';
     if (contentMutationLocked) return '正文生成任务正在运行或暂停中，请结束后再调整目录';
     if (rulePageCompiling) return '规则和页码正在编制，请结束后再调整目录';
+    if (includeDocumentAdjustment && documentAdjustmentEnabled) return '已启用 AI 调整，目录修改请通过 AI 调整完成；如需手动调整，请先重置正文阶段';
     return '';
   };
 
@@ -605,7 +623,7 @@ function OutlineEditPage({
     if (!outlineData?.outline?.length) {
       return;
     }
-    const lockMessage = getMutationLockMessage();
+    const lockMessage = getMutationLockMessage(false);
     if (lockMessage) {
       showToast(lockMessage, 'info');
       return;
@@ -638,7 +656,7 @@ function OutlineEditPage({
       discardSorting();
       return;
     }
-    const lockMessage = getMutationLockMessage();
+    const lockMessage = getMutationLockMessage(false);
     if (lockMessage) {
       throw new Error(lockMessage);
     }
@@ -858,7 +876,7 @@ function OutlineEditPage({
                 </button>
                 )}
                 {outlineData && (
-                  <button type="button" onClick={startSorting} disabled={outlineMutationLocked || !outlineData?.outline?.length}>目录排序</button>
+                  <button type="button" onClick={startSorting} disabled={outlineSortLocked || !outlineData?.outline?.length}>目录排序</button>
                 )}
                 <button type="button" onClick={expandAllItems} disabled={!activeOutlineData?.outline?.length}>全部展开</button>
                 <button type="button" onClick={collapseAllItems} disabled={!activeOutlineData?.outline?.length}>全部折叠</button>
@@ -888,7 +906,7 @@ function OutlineEditPage({
           </div>
           {selectedItem ? (
             <div className="outline-detail-body">
-              {(generating || templateExtracting || contentMutationLocked || rulePageCompiling || sorting) && (
+              {(generating || templateExtracting || contentMutationLocked || rulePageCompiling || sorting || documentAdjustmentEnabled) && (
                 <div className="outline-detail-lock">
                   {sorting
                     ? '目录排序中，当前目录暂不可编辑。'
@@ -898,6 +916,8 @@ function OutlineEditPage({
                       ? '正文生成任务正在运行或暂停中，当前目录暂不可编辑。'
                     : rulePageCompiling
                       ? '规则和页码正在编制，当前目录暂不可编辑。'
+                    : documentAdjustmentEnabled && !generating
+                      ? '已启用 AI 调整：目录的新增、编辑和删除请通过 AI 调整完成，排序仍可使用；如需手动调整，请先重置正文阶段。'
                       : '目录生成任务正在运行，当前目录暂不可编辑，避免覆盖后台生成结果。'}
                 </div>
               )}

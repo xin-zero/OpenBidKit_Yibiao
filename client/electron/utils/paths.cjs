@@ -179,6 +179,11 @@ function getPlatformArchKey() {
   return `${process.platform}-${process.arch}`;
 }
 
+/** 按需下载的功能组件（如文字识别运行库和模型）根目录，每个依赖一个子目录。 */
+function getDependenciesDir(app) {
+  return path.join(getUserDataPath(app), 'dependencies');
+}
+
 function getBundledAgentToolsBinDir(app) {
   if (process.env.YIBIAO_AGENT_TOOLS_BIN_DIR) {
     return process.env.YIBIAO_AGENT_TOOLS_BIN_DIR;
@@ -233,7 +238,24 @@ function getBundledOpenXmlHelperPath(app) {
   return path.join(getBundledOpenXmlHelperDir(app), fileName);
 }
 
+/** 安装包内随版本附带的诊断资料（构建时从提交导出的源码）。 */
+function getBundledDiagnosisSourceDir() {
+  return path.join(process.resourcesPath, 'diagnosis-source');
+}
+
+/** 诊断 Agent 阅读的源码资料：安装版为同步到 userData 的副本，开发版直接使用仓库根目录。 */
+function getDiagnosisSourceDir(app) {
+  if (app.isPackaged) return path.join(getUserDataPath(app), 'diagnosis-source');
+  return path.join(__dirname, '..', '..', '..');
+}
+
+/** 导出失败后才建立现场目录，与当前投标项目一起清理。 */
+function getTechnicalPlanExportFailureDir(app, failureId = '') {
+  return path.join(getTechnicalPlanDir(app), 'export-failures', failureId);
+}
+
 module.exports = {
+  getTechnicalPlanExportFailureDir,
   getAgentRuntimeDir,
   getAiLogsDir,
   getAiRawLogsDir,
@@ -242,9 +264,12 @@ module.exports = {
   getBlindCheckFixedDir,
   getBlindCheckTenderDir,
   getBundledAgentToolsBinDir,
+  getBundledDiagnosisSourceDir,
   getBundledOpenXmlHelperDir,
   getBundledOpenXmlHelperPath,
+  getDependenciesDir,
   getDeveloperLogsDir,
+  getDiagnosisSourceDir,
   getDuplicateCheckContentDir,
   getDuplicateCheckDir,
   getConfigFilePath,

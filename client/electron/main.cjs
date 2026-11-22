@@ -6,6 +6,7 @@ const { registerIpcHandlers } = require('./ipc/index.cjs');
 const { setupAutoUpdate, checkAndDownloadUpdate, triggerUpdateDownload, isUpdateCacheInUse, quitAndInstall, getLatestVersion, getUpdateDownloadUrl } = require('./services/updateService.cjs');
 const { getConfigFilePath, getCredentialLibraryDir, getGeneratedImagesDir, getGpuStartupProbePath, getImportedImagesDir, getNoticeCacheDir } = require('./utils/paths.cjs');
 const { createNoticeMediaResponse } = require('./services/noticeMediaResponse.cjs');
+const { ensureDiagnosisSource } = require('./services/diagnosisSourceService.cjs');
 
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 const iconPath = path.join(__dirname, '../assets/icon.ico');
@@ -508,13 +509,18 @@ app.whenReady().then(() => {
     closeDeveloperTokenStatsWindow,
     openDeveloperAgentMonitorWindow,
     closeDeveloperAgentMonitorWindow,
+    getRendererWindowUrl: (windowName) => appendWindowQuery(rendererUrl || packagedIndexUrl, windowName),
   });
   setupAutoUpdate({ app, mainWindow });
   mainWindow.on('closed', () => {
     closeDeveloperTokenStatsWindow();
     closeDeveloperAgentMonitorWindow();
+    // 隐藏的转换工作窗口不关掉的话，应用不会因为窗口全部关闭而退出。
+    services?.closeHiddenWindows?.();
   });
   void checkBlockedIpAfterStartup();
+  // 升级后在后台同步诊断资料，空转诊断前会等待同一次同步完成。
+  ensureDiagnosisSource(app).catch(error => console.warn('[diagnosis-source] 同步诊断资料失败', error));
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

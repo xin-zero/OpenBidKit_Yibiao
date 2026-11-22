@@ -43,7 +43,7 @@ export interface ImageModelTestResult {
   mime_type?: string;
 }
 
-export type ImageModelProvider = 'jinlong' | 'volcengine' | 'google-ai-studio' | 'agnes' | 'custom' | 'comfyui';
+export type ImageModelProvider = 'official' | 'jinlong' | 'volcengine' | 'google-ai-studio' | 'agnes' | 'custom' | 'comfyui';
 export type ImageModelStatus = 'untested' | 'available' | 'unavailable';
 export type ImageModelSize = 'auto' | '512' | '1K' | '2K' | '3K' | '4K' | '1024x768' | '1024x1024' | '768x1024' | '1536x1024' | '1024x1536' | '2048x2048' | '2048x1152' | '3840x2160' | '2160x3840';
 export type ImageModelRatio = '1:1' | '3:4' | '4:3' | '16:9' | '9:16' | '2:3' | '3:2' | '21:9';
@@ -55,6 +55,7 @@ export interface ImageModelConfig {
   model_name: string;
   image_size: ImageModelSize;
   image_ratio?: ImageModelRatio;
+  image_watermark?: boolean;
   request_mode: AiRequestMode;
   concurrency_limit: number;
   comfyui_workflow?: string;
@@ -88,6 +89,7 @@ export interface ClientConfig extends AiConfig {
   gpu_hardware_acceleration_enabled?: boolean;
   gpu_hardware_acceleration_configured?: boolean;
   export_format?: import('./exportFormat').ExportFormatConfig;
+  technical_plan_default_export_template_id?: string;
   developer_mode?: boolean;
   developer_token_stats_auto_open?: boolean;
   developer_agent_monitor_auto_open?: boolean;

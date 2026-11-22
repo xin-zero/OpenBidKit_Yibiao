@@ -3,9 +3,10 @@ const path = require('node:path');
 const { getConfigFilePath } = require('../utils/paths.cjs');
 const { createAnalyticsClientId } = require('../utils/machineIdentity.cjs');
 const { defaultExportFormat, normalizeExportFormat } = require('./exportFormatDefaults.cjs');
+const { DEFAULT_EXPORT_TEMPLATE_ID } = require('./systemExportTemplates.cjs');
 
 const textModelProviders = ['official', 'jinlong', 'volcengine', 'deepseek', 'agnes', 'custom'];
-const imageModelProviders = ['jinlong', 'volcengine', 'google-ai-studio', 'agnes', 'custom', 'comfyui'];
+const imageModelProviders = ['official', 'jinlong', 'volcengine', 'google-ai-studio', 'agnes', 'custom', 'comfyui'];
 const aiRequestModes = ['normal', 'stream'];
 const updateChannels = ['github', 'cloudflare', 'atomgit'];
 const DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT = 400000;
@@ -112,6 +113,18 @@ const defaultTextModelProfiles = {
 };
 
 const defaultImageModelProfiles = {
+  official: {
+    provider: 'official',
+    base_url: textProviderBaseUrls.official,
+    api_key: '',
+    model_name: 'IMAGE_GENERATION',
+    image_size: '1024x1024',
+    request_mode: 'stream',
+    concurrency_limit: 50,
+    status: 'untested',
+    tested_at: '',
+    last_error: '',
+  },
   jinlong: {
     provider: 'jinlong',
     base_url: 'https://img-api.jlaudeapi.com/v1',
@@ -131,6 +144,7 @@ const defaultImageModelProfiles = {
     model_name: '',
     image_size: '1024x1024',
     image_ratio: '1:1',
+    image_watermark: false,
     request_mode: 'normal',
     concurrency_limit: DEFAULT_IMAGE_CONCURRENCY_LIMIT,
     status: 'untested',
@@ -209,6 +223,7 @@ const defaultConfig = {
   gpu_hardware_acceleration_enabled: true,
   gpu_hardware_acceleration_configured: true,
   export_format: defaultExportFormat,
+  technical_plan_default_export_template_id: DEFAULT_EXPORT_TEMPLATE_ID,
   agent_auto_answer_enabled: DEFAULT_AGENT_AUTO_ANSWER_ENABLED,
   developer_mode: false,
   developer_token_stats_auto_open: false,
@@ -428,9 +443,18 @@ function normalizeImageRatio(value) {
   return agnesImageRatios.includes(value) ? value : '1:1';
 }
 
+// 固定官方生图运行参数，并保存各服务商的测试结果。
 function normalizeImageModelProfile(provider, profile) {
   const defaults = defaultImageModelProfiles[provider];
   const source = profile || {};
+  if (provider === 'official') {
+    return {
+      ...defaults,
+      status: source.status ?? defaults.status,
+      tested_at: source.tested_at ?? defaults.tested_at,
+      last_error: source.last_error ?? defaults.last_error,
+    };
+  }
   const useProviderDefaultImageModel = provider === 'jinlong' && !String(source.model_name ?? '').trim();
   return {
     provider,
@@ -441,6 +465,7 @@ function normalizeImageModelProfile(provider, profile) {
     model_name: useProviderDefaultImageModel ? defaults.model_name : source.model_name !== undefined ? source.model_name : defaults.model_name,
     image_size: normalizeImageSize(provider, useProviderDefaultImageModel ? defaults.image_size : source.image_size, defaults.image_size),
     ...(provider === 'agnes' ? { image_ratio: normalizeImageRatio(source.image_ratio) } : {}),
+    ...(provider === 'volcengine' ? { image_watermark: source.image_watermark !== undefined ? Boolean(source.image_watermark) : defaults.image_watermark } : {}),
     request_mode: normalizeAiRequestMode(useProviderDefaultImageModel ? defaults.request_mode : source.request_mode, defaults.request_mode),
     concurrency_limit: normalizeImageConcurrencyLimit(source.concurrency_limit, defaults.concurrency_limit),
     comfyui_workflow: source.comfyui_workflow !== undefined ? String(source.comfyui_workflow) : (defaults.comfyui_workflow || ''),
@@ -521,6 +546,7 @@ function normalizeConfig(config) {
     gpu_hardware_acceleration_enabled: gpuHardwareAccelerationEnabled,
     gpu_hardware_acceleration_configured: gpuHardwareAccelerationConfigured === false ? true : gpuHardwareAccelerationConfigured,
     export_format: normalizeExportFormat(source.export_format),
+    technical_plan_default_export_template_id: source.technical_plan_default_export_template_id ?? defaultConfig.technical_plan_default_export_template_id,
     agent_auto_answer_enabled: source.agent_auto_answer_enabled === undefined
       ? defaultConfig.agent_auto_answer_enabled
       : Boolean(source.agent_auto_answer_enabled),

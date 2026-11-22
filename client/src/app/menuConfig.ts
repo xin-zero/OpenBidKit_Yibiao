@@ -87,9 +87,15 @@ export const appMenuItems: AppMenuItem[] = [
   },
   {
     id: 'resource-download',
-    label: '资源下载',
-    description: '插件扩展与投标资料下载',
+    label: '其他功能',
+    description: '实用工具、插件扩展与投标资料下载',
     children: [
+      {
+        id: 'dual-layer-pdf',
+        label: 'Word批量转换（双层PDF、图片）',
+        description: '把 Word 批量转换成双层 PDF 或逐页图片',
+        icon: 'export',
+      },
       {
         id: 'plugin-manager',
         label: '插件管理',
