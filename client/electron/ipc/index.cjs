@@ -157,7 +157,6 @@ const workspaceDatabaseChannels = [
   'technical-plan:remove-tender-document',
   'technical-plan:import-original-plan-document',
   'technical-plan:remove-original-plan-document',
-  'technical-plan:check-bid-sections',
   'technical-plan:select-bid-section',
   'technical-plan:read-tender-markdown',
   'technical-plan:read-content-word',
@@ -232,6 +231,7 @@ const workspaceDatabaseChannels = [
   'knowledge-base:read-analysis',
   'tasks:start-bid-section-extraction',
   'tasks:start-bid-analysis',
+  'tasks:cancel-pending-bid-analysis',
   'tasks:start-outline-generation',
   'tasks:confirm-outline-selection',
   'tasks:suppress-outline-selection-auto-confirmation',
@@ -415,9 +415,9 @@ function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerU
   const autoConfirmationService = createAutoConfirmationService({ configStore });
   const agentService = createAgentService({ app, configStore, aiService, licenseService, autoConfirmationService });
   const fileService = createFileService({ app, configStore });
-  const openXmlHelperService = createOpenXmlHelperService({ app, configStore });
+  const openXmlHelperService = createOpenXmlHelperService({ app });
   let technicalPlanExport;
-  const exportService = createExportService({ configStore, openXmlHelperService, getTechnicalPlanExport: () => technicalPlanExport });
+  const exportService = createExportService({ openXmlHelperService, getTechnicalPlanExport: () => technicalPlanExport });
   const systemFontService = createSystemFontService();
   const dependencyService = createDependencyService({
     app,

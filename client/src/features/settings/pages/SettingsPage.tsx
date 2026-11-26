@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import jevDefaults from '../../../../electron/shared/jevDefaults.json';
 import { trackConfigUsage } from '../../../shared/analytics/analytics';
 import { AppDialog, AppSwitch, DetailHelpLink, FloatingToolbar, InlineSpinner, InputWithAction, OfflineLicenseActivationDialog, useAutoAnswer, useToast } from '../../../shared/ui';
 import { showUpdateReadyToast } from '../../../shared/updateToast';
@@ -78,7 +79,7 @@ const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_TEXT_TEMPERATURE = 0.7;
 
 const textProviderDefaults: Record<TextModelProvider, TextModelConfig> = {
-  official: { api_key: '', base_url: 'https://v3.yibiao.pro/qhp-ai/anonymous/openai/v1', model_name: 'TEXT_GENERATION', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  official: { api_key: '', base_url: '', model_name: 'TEXT_GENERATION', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   jinlong: { api_key: '', base_url: 'https://jlaudeapi.com/v1', model_name: 'gpt-3.5-turbo', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   volcengine: { api_key: '', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   deepseek: { api_key: '', base_url: 'https://api.deepseek.com', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
@@ -502,6 +503,9 @@ function normalizeComponentsState(components?: Partial<ComponentsConfig>): Setti
     },
     mermaid_concurrency_limit: normalizeComponentConcurrencyLimit(components?.mermaid_concurrency_limit),
     html_concurrency_limit: normalizeComponentConcurrencyLimit(components?.html_concurrency_limit),
+    jev_base_url: components?.jev_base_url ?? '',
+    jev_model_name: components?.jev_model_name ?? jevDefaults.modelName,
+    jev_api_key: components?.jev_api_key ?? '',
   };
 }
 
@@ -514,6 +518,9 @@ function componentsFromState(components: SettingsPageState['components']): Compo
     },
     mermaid_concurrency_limit: normalizeComponentConcurrencyLimit(components.mermaid_concurrency_limit),
     html_concurrency_limit: normalizeComponentConcurrencyLimit(components.html_concurrency_limit),
+    jev_base_url: components.jev_base_url.trim(),
+    jev_model_name: components.jev_model_name.trim(),
+    jev_api_key: components.jev_api_key.trim(),
   };
 }
 
@@ -649,14 +656,7 @@ const initialState: SettingsPageState = {
     ...imageProviderDefaults.jinlong,
   },
   imageModelProfiles: createDefaultImageModelProfiles(),
-  components: {
-    file_parser: {
-      provider: 'local',
-      mineru_token: '',
-    },
-    mermaid_concurrency_limit: DEFAULT_COMPONENT_CONCURRENCY_LIMIT,
-    html_concurrency_limit: DEFAULT_COMPONENT_CONCURRENCY_LIMIT,
-  },
+  components: normalizeComponentsState(),
   general: {
     developer_mode: false,
     developer_token_stats_auto_open: false,
@@ -678,7 +678,7 @@ interface SettingsPageProps {
 function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, registerLeaveGuard }: SettingsPageProps) {
   const [state, setState] = useState<SettingsPageState>(initialState);
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => request?.tab ?? 'general');
-  const [rechargeRequested, setRechargeRequested] = useState(false);
+  const textProviderRef = useRef<HTMLSelectElement>(null);
   const [savedConfig, setSavedConfig] = useState<ClientConfig | null>(null);
   const [officialApiTab, setOfficialApiTab] = useState<OfficialApiTab>('statement');
   const [textModels, setTextModels] = useState<string[]>([]);
@@ -688,6 +688,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
   const [loadingModelInfo, setLoadingModelInfo] = useState(false);
   const [testingTextModel, setTestingTextModel] = useState(false);
   const [testingImageModel, setTestingImageModel] = useState(false);
+  const [testingJev, setTestingJev] = useState(false);
   const textModelBusy = loadingModels === 'text' || loadingModelInfo || testingTextModel;
   const [imageTestPreview, setImageTestPreview] = useState<{ src: string; title: string } | null>(null);
   const [appVersion, setAppVersion] = useState('');
@@ -805,20 +806,23 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
     return () => { disposed = true; unsubscribe(); };
   }, [configLoaded]);
 
-  // 应用级跳转请求只消费一次，之后重新进入设置页或切换分类不会再次触发。
+  // 设置分类就绪后再打开订单或聚焦服务商，并消费本次跳转请求。
   useEffect(() => {
     if (!request) return;
-    void changeSettingsTab(request.tab);
-    if (request.openRecharge) setRechargeRequested(true);
-    onRequestHandled?.();
-  }, [request, onRequestHandled, changeSettingsTab]);
-
-  // 充值只在官方文本模型页打开；已切走或当前不是官方服务商时放弃本次请求。
-  useEffect(() => {
-    if (rechargeRequested && configLoaded && (activeTab !== 'text-model' || state.textModel.provider !== 'official')) {
-      setRechargeRequested(false);
+    if (request.tab !== activeTab) {
+      void changeSettingsTab(request.tab);
+      return;
     }
-  }, [activeTab, configLoaded, rechargeRequested, state.textModel.provider]);
+    if (request.showOfficialOrders) setOfficialApiTab('orders');
+    if (request.focusTextProvider) {
+      const frame = requestAnimationFrame(() => {
+        textProviderRef.current?.focus();
+        onRequestHandled?.();
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+    onRequestHandled?.();
+  }, [request, activeTab, onRequestHandled, changeSettingsTab]);
 
   // 弹窗中的自动确认开关实时保存后，同步刷新设置页草稿和已保存基准。
   useEffect(() => {
@@ -1162,6 +1166,32 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
       }
     } catch (error) {
       showToast(error instanceof Error ? error.message : '打开生图服务 API Key 获取页面失败', 'error');
+    }
+  };
+
+  // 用系统浏览器打开 Jev 的密钥管理页。
+  const openJevApiKeyPage = async () => {
+    try {
+      const result = await window.yibiao?.openExternal('https://console.typesafe.ai/keys');
+      if (result && !result.success) {
+        showToast(result.message || '打开 Jev API Key 获取页面失败', 'error');
+      }
+    } catch {
+      showToast('打开 Jev API Key 获取页面失败', 'error');
+    }
+  };
+
+  // 测试当前 Jev 配置草稿，不保存配置。
+  const testJevConfig = async () => {
+    const { jev_base_url: baseUrl, jev_model_name: modelName, jev_api_key: apiKey } = state.components;
+    setTestingJev(true);
+    try {
+      await window.yibiao!.ai.testJev({ baseUrl, modelName, apiKey });
+      showToast('Jev 测试成功', 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Jev 测试失败', 'error');
+    } finally {
+      setTestingJev(false);
     }
   };
 
@@ -1824,7 +1854,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
             <label className="settings-row">
               <div className="settings-row-copy">
                 <strong>开发者模式</strong>
-                <span>会打乱既有工作流，生成大量日志占用磁盘空间，<strong>非专业人士请勿开启</strong></span>
+                <span>会改变部分工作流，<strong>非专业人士请勿开启</strong></span>
               </div>
               <AppSwitch checked={state.general.developer_mode} onCheckedChange={(checked) => updateDeveloperMode(checked)} />
             </label>
@@ -1869,7 +1899,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                 <div className="settings-row">
                   <div className="settings-row-copy">
                     <strong>配置文件夹</strong>
-                    <span>打开本机配置、工作区缓存和开发者日志所在目录</span>
+                    <span>打开本机配置、工作区缓存和诊断日志所在目录</span>
                   </div>
                   <div className="settings-action-cell">
                     <button type="button" className="inline-action" onClick={openConfigFolder}>
@@ -1893,6 +1923,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                 {state.textModel.provider !== 'official' && <span>选择服务商会自动使用预置 Base URL；只有自定义服务商允许修改</span>}
               </div>
               <select
+                ref={textProviderRef}
                 value={state.textModel.provider}
                 onChange={(event) => updateTextModelProvider(event.target.value as TextModelProvider)}
               >
@@ -1918,8 +1949,6 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                   </select>
                 </label>
               )}
-              rechargeRequested={configLoaded && rechargeRequested}
-              onRechargeRequestHandled={() => setRechargeRequested(false)}
             />
           ) : (
             <>
@@ -2247,8 +2276,6 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                   </div>
                 </div>
               )}
-              rechargeRequested={configLoaded && rechargeRequested}
-              onRechargeRequestHandled={() => setRechargeRequested(false)}
             />
           ) : (
             <>
@@ -2489,6 +2516,75 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                 }))}
               />
             </label>
+          </div>
+
+          <div className="settings-group-title">Jev</div>
+          <div className="settings-list">
+            <div className="settings-row">
+              <label className="settings-row-copy" htmlFor="jev-base-url"><strong>Base URL</strong></label>
+              <InputWithAction
+                id="jev-base-url"
+                type="text"
+                value={state.components.jev_base_url}
+                disabled={testingJev}
+                onChange={(event) => setState((prev) => ({
+                  ...prev,
+                  components: { ...prev.components, jev_base_url: event.target.value },
+                }))}
+                actionLabel="重置"
+                actionDisabled={testingJev || state.components.jev_base_url === jevDefaults.baseUrl}
+                onAction={() => setState((prev) => ({
+                  ...prev,
+                  components: { ...prev.components, jev_base_url: jevDefaults.baseUrl },
+                }))}
+              />
+            </div>
+            <div className="settings-row">
+              <label className="settings-row-copy" htmlFor="jev-model-name"><strong>模型名称</strong></label>
+              <InputWithAction
+                id="jev-model-name"
+                type="text"
+                value={state.components.jev_model_name}
+                disabled={testingJev}
+                onChange={(event) => setState((prev) => ({
+                  ...prev,
+                  components: { ...prev.components, jev_model_name: event.target.value },
+                }))}
+                actionLabel="重置"
+                actionDisabled={testingJev || state.components.jev_model_name === jevDefaults.modelName}
+                onAction={() => setState((prev) => ({
+                  ...prev,
+                  components: { ...prev.components, jev_model_name: jevDefaults.modelName },
+                }))}
+              />
+            </div>
+            <div className="settings-row">
+              <label className="settings-row-copy" htmlFor="jev-api-key"><strong>API Key</strong></label>
+              <div className="settings-control-with-action is-single-action">
+                <InputWithAction
+                  id="jev-api-key"
+                  type="password"
+                  value={state.components.jev_api_key}
+                  placeholder="请输入 Jev API Key"
+                  disabled={testingJev}
+                  onChange={(event) => setState((prev) => ({
+                    ...prev,
+                    components: { ...prev.components, jev_api_key: event.target.value },
+                  }))}
+                  actionLabel="获取"
+                  onAction={openJevApiKeyPage}
+                />
+                <button
+                  type="button"
+                  className="inline-action"
+                  onClick={testJevConfig}
+                  disabled={testingJev || !state.components.jev_api_key.trim()}
+                >
+                  {testingJev && <InlineSpinner />}
+                  {testingJev ? '测试中' : '测试'}
+                </button>
+              </div>
+            </div>
           </div>
         </section>
       )}
